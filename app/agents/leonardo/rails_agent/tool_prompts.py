@@ -216,6 +216,123 @@ Usage:
 # VIEW PAGE TOOL (for future reference)
 # =============================================================================
 
+# =============================================================================
+# LEONARDO.MD TOOLS
+# =============================================================================
+
+READ_LEONARDO_MD_DESCRIPTION = """Read the LEONARDO.md project context file.
+This file contains project-specific instructions, context, and configuration that guides your behavior.
+It lives at .leonardo/LEONARDO.md and is always loaded into your system prompt.
+Use this to see the current contents before making edits."""
+
+EDIT_LEONARDO_MD_DESCRIPTION = """Edit the LEONARDO.md project context file by replacing text.
+Parameters:
+- old_string: The exact text to find and replace (must be unique in the file)
+- new_string: The text to replace it with
+
+Use this when the user asks you to update project instructions, add context, or modify LEONARDO.md.
+The file is at .leonardo/LEONARDO.md and changes will take effect on the next conversation."""
+
+WRITE_LEONARDO_MD_DESCRIPTION = """Create or completely overwrite the LEONARDO.md project context file.
+Parameters:
+- content: The full content to write to LEONARDO.md
+
+Use this only when creating LEONARDO.md for the first time or when the user wants a complete rewrite.
+Prefer edit_leonardo_md for partial changes."""
+
+# =============================================================================
+# MEMORY TOOLS
+# =============================================================================
+
+SAVE_MEMORY_DESCRIPTION = """Save information to long-term memory that persists across conversations.
+
+Use this when:
+- The user explicitly says "remember this", "don't forget", or similar
+- The user corrects your behavior and you should remember the correction
+- The user states preferences about how they want things done
+- Important project context that should persist across sessions
+
+Do NOT save:
+- Routine task details or temporary debugging info
+- Information already in LEONARDO.md or MEMORY.md
+- Trivial or obvious information
+
+Parameters:
+- name: Short descriptive name (e.g., "prefers-tailwind-over-bootstrap")
+- description: One-line summary of what this memory contains
+- memory_type: One of "user", "feedback", "project", "reference"
+  - user: Role, preferences, communication style
+  - feedback: Corrections to agent behavior
+  - project: Ongoing work, architecture decisions, business context
+  - reference: External resources, API docs, links
+- content: The actual memory content (max 2000 chars)
+"""
+
+LIST_MEMORIES_DESCRIPTION = """List all saved memories with their names, types, and descriptions.
+Use this to check what has been remembered before saving duplicates.
+Also use when the user asks "what do you remember?" or similar."""
+
+DELETE_MEMORY_DESCRIPTION = """Delete a memory by filename (e.g., "prefers-tailwind.md").
+Use when the user asks to forget something, or when a memory is outdated and being replaced."""
+
+HARD_RESTART_RAILS_DESCRIPTION = """Forcefully restart the Rails (LlamaPress) container — a "hard kick" when a soft restart isn't enough.
+
+This stops and restarts the entire Rails container process. Use it when:
+- A soft restart (`rm -f tmp/restart.txt && touch tmp/restart.txt` via `bash_command`) didn't pick up the change.
+- You changed Gemfile / Gemfile.lock and need bundler to re-resolve.
+- You changed an initializer in `config/initializers/` or anything Puma loads at boot.
+- You changed env vars in `.env` that Rails reads at boot.
+- The Rails process is wedged / unresponsive and needs to be killed.
+
+For ordinary code or routes changes, PREFER the soft restart over this tool — it's ~2s vs ~15-30s, keeps DB connections warm, and is gentler on the user. Reach for hard_restart_rails only when the soft path is insufficient.
+
+What this does NOT do:
+- Restart the LlamaBot (your own) container. You'd kill yourself mid-call.
+- Re-read `docker-compose.yml`. For that, the user has a `/restart` slash command.
+
+After calling this, the container is briefly unavailable (~10-30s). Tell the user the page will be unreachable for a few seconds and come back automatically. Do not retry `bash_command` immediately after — wait until the container is back.
+"""
+
+FIX_PERMISSIONS_DESCRIPTION = """Fix file permission errors in the Rails container by resetting ownership on common problematic directories (tmp/, coverage/, log/).
+
+## WHEN TO USE THIS TOOL (MANDATORY)
+
+Call this tool IMMEDIATELY when you see ANY of these errors:
+- "Permission denied" (e.g., sprockets cache, tmp/cache/assets, coverage/)
+- "EACCES"
+- "Operation not permitted"
+- "apply2files" errors from sprockets cache
+
+This is the ONLY correct fix for permission errors. After calling this tool, retry your original command.
+
+## NEVER DO THESE INSTEAD:
+- ❌ Do NOT disable sprockets cache in config/environments/test.rb or any environment file
+- ❌ Do NOT modify Rails config files to work around permission errors
+- ❌ Do NOT run chmod/chown via bash_command — it runs as UID 1000 which cannot fix root-owned files
+- ❌ Do NOT try `sudo` — it's not available in the container
+
+These are all anti-patterns. The fix_permissions tool runs as root inside the Rails container and resets ownership. That's the correct solution. It is safe to run multiple times (idempotent).
+"""
+
+TAIL_RAILS_LOGS_DESCRIPTION = """Read recent stdout/stderr logs from the Rails container via the Docker logs API.
+
+Works even when the Rails container is STOPPED or CRASHED — Docker keeps the logs around. This is the primary
+diagnostic tool when `bash_command` fails with "409 Conflict" or "container not running" — that means the
+Rails process exited (usually a bad migration, missing gem, or syntax error on boot), and the logs hold the
+real reason.
+
+When to use:
+- `bash_command` just returned "409", "container not running", or hangs — read the logs to find out why Rails died.
+- A `bundle exec rails db:migrate` or `db:prepare` step failed and you need the actual error message.
+- The user reports "the page is broken", a 500 error, or "nothing is loading".
+- After a long-running request, to see server-side output (rendered template, query log, exception trace).
+
+Parameters:
+- lines: Number of recent log lines to return (default 200, max 2000).
+
+Returns the demultiplexed log text (stdout + stderr interleaved). Does not write a file.
+"""
+
 VIEW_CURRENT_PAGE_HTML_DESCRIPTION = """
 The `view_page` tool gives you what the user is seeing, and backend context, as ground truth for all UI-related/exploratory questions.
 

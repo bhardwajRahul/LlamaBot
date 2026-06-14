@@ -19,6 +19,7 @@ export class PlanMessageRenderer {
    */
   createPlanMessage(planTitle, steps, options = {}) {
     const uniqueId = generateUniqueId('plan');
+    const agentDepth = options.agentDepth || 0;
 
     const inProgressTasks = steps.filter(s => s.status === 'in_progress');
     const pendingTasks = steps.filter(s => s.status === 'pending');
@@ -26,11 +27,11 @@ export class PlanMessageRenderer {
 
     // Main active task display (only show if there's something in progress)
     const activeTaskHTML = inProgressTasks.length > 0
-      ? this._renderActiveTask(inProgressTasks[0], uniqueId)
+      ? this._renderActiveTask(inProgressTasks[0], uniqueId, agentDepth)
       : '';
 
     // Subtle progress indicator
-    const progressHTML = this._renderProgressIndicator(completedTasks.length, steps.length, uniqueId);
+    const progressHTML = this._renderProgressIndicator(completedTasks.length, steps.length, uniqueId, agentDepth);
 
     // All tasks list (expandable dropdown)
     const allTasksHTML = steps.length > 0
@@ -38,7 +39,7 @@ export class PlanMessageRenderer {
       : '';
 
     return `
-      <div class="plan-modern" data-plan-id="${uniqueId}">
+      <div class="plan-modern" data-plan-id="${uniqueId}" data-agent-depth="${agentDepth}">
         ${activeTaskHTML}
         ${progressHTML}
         ${allTasksHTML}
@@ -49,9 +50,11 @@ export class PlanMessageRenderer {
   /**
    * Render the active task with prominent shimmer effect
    */
-  _renderActiveTask(task, planId) {
+  _renderActiveTask(task, planId, agentDepth = 0) {
     const taskId = `active-${planId}`;
-    const displayText = task.activeForm || task.content;
+    const baseText = task.activeForm || task.content;
+    // Add emoji prefix for sub-agent tasks
+    const displayText = agentDepth > 0 ? `🔹 ${baseText}` : baseText;
 
     return `
       <div class="plan-active-task" data-task-id="${taskId}">
@@ -69,20 +72,22 @@ export class PlanMessageRenderer {
   /**
    * Render minimal progress indicator
    */
-  _renderProgressIndicator(completed, total, planId) {
+  _renderProgressIndicator(completed, total, planId, agentDepth = 0) {
     if (total === 0) return '';
 
     const percentage = Math.round((completed / total) * 100);
     const allDone = completed === total;
+    // Add emoji prefix for sub-agent progress
+    const prefix = agentDepth > 0 ? '🔹 ' : '';
 
     return `
       <div class="plan-progress-bar" data-progress-id="${planId}">
         <div class="plan-progress-fill" style="width: ${percentage}%"></div>
       </div>
-      <div class="plan-progress-text" onclick="togglePlanDetails('${planId}')">
+      <div class="plan-progress-text expanded" onclick="togglePlanDetails('${planId}')">
         ${allDone
-          ? `<span class="plan-done-badge">✓ Complete</span>`
-          : `<span class="plan-count">${completed}/${total} tasks</span>`
+          ? `<span class="plan-done-badge">${prefix}✓ Complete</span>`
+          : `<span class="plan-count">${prefix}${completed}/${total} tasks</span>`
         }
         <svg class="plan-expand-arrow" viewBox="0 0 16 16" fill="none">
           <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -116,7 +121,7 @@ export class PlanMessageRenderer {
     }).join('');
 
     return `
-      <div class="plan-tasks-list" id="plan-details-${planId}" style="display: none;">
+      <div class="plan-tasks-list" id="plan-details-${planId}">
         <div class="plan-tasks-header">All Tasks</div>
         ${tasksHTML}
       </div>
@@ -201,7 +206,7 @@ export class PlanMessageRenderer {
         `;
       } else {
         const newTasksHTML = `
-          <div class="plan-tasks-list" id="plan-details-${planId}" style="display: none;">
+          <div class="plan-tasks-list" id="plan-details-${planId}">
             <div class="plan-tasks-header">All Tasks</div>
             ${tasksHTML}
           </div>
@@ -245,14 +250,6 @@ window.togglePlanDetails = function(planId) {
     // Toggle expanded class on progress text for arrow rotation
     if (progressText) {
       progressText.classList.toggle('expanded', !isVisible);
-    }
-
-    // Animate in
-    if (!isVisible) {
-      detailsElement.style.opacity = '0';
-      setTimeout(() => {
-        detailsElement.style.opacity = '1';
-      }, 10);
     }
   }
 };

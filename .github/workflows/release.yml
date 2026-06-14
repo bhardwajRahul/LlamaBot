@@ -1,0 +1,163 @@
+name: Release
+
+# Publishes the llamabot Docker image to Docker Hub — but ONLY after the image
+# builds and boots successfully. This replaces running `docker buildx ... --push`
+# by hand from a laptop (see the comment at the bottom of the Dockerfile), so an
+# untested image can never reach prod.
+#
+# How to release:
+#   git tag v0.5.1
+#   git push origin v0.5.1
+# That publishes kody06/llamabot:0.5.1 (+ a :sha-<shortsha> tag).
+# Then bump the image tag in Leonardo's docker-compose.yml and let Leonardo's
+# CI (e2e smoke) validate the new composition.
+#
+# To dry-run (build + smoke test, NO push), use the "Run workflow" button in
+# the Actions tab with dry_run = true.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image version tag, e.g. 0.5.1 (used only for manual runs)'
+        required: false
+      dry_run:
+        description: 'Build and smoke-test only; do NOT push to Docker Hub'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: kody06/llamabot
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    # The auth layer needs a real database before /login can serve (mirrors
+    # the postgres service in LlamaPress-Simple's release workflow).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: llamabot_production
+        ports:
+          - 5432:5432
+        options: --health-cmd="pg_isready" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: meta
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"            # strip an optional leading "v"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            v="${{ github.event.inputs.version }}"
+          elif [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            v="0.0.0-dryrun"                     # dry runs push nothing; version is cosmetic
+          else
+            echo "::error::No version. Push a git tag (vX.Y.Z) or set the 'version' input."
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Releasing version '$v' (sha-$(git rev-parse --short HEAD))"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 1) Build amd64 only, load it locally, and boot it BEFORE pushing anything.
+      - name: Build amd64 image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}:smoke-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Boot gate: agents must compile (placeholder API keys are enough —
+      # provider clients only check the env var exists) and the auth layer
+      # must come up against a real database. Deep integration is covered by
+      # the e2e job in ci.yml.
+      - name: Smoke test - boot container and verify /login serves
+        run: |
+          docker run -d --name release_smoke --network host \
+            -e AUTH_DB_URI=postgresql://postgres:postgres@localhost:5432/llamabot_production \
+            -e OPENAI_API_KEY=ci-smoke \
+            -e ANTHROPIC_API_KEY=ci-smoke \
+            -e GOOGLE_API_KEY=ci-smoke \
+            -e DEEPSEEK_API_KEY=ci-smoke \
+            -e TAVILY_API_KEY=ci-smoke \
+            ${{ env.IMAGE }}:smoke-test
+          echo "Waiting for uvicorn to serve /login..."
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/login || true)
+            echo "attempt $i: /login -> ${code:-no-response}"
+            # 200 once users exist; 302 (-> /register) on a fresh database.
+            case "$code" in 200|302) echo "Boot OK - image is healthy"; exit 0;; esac
+            if ! docker ps --format '{{.Names}}' | grep -q '^release_smoke$'; then
+              echo "::error::Container exited before becoming healthy"
+              docker logs release_smoke
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "::error::App did not become healthy within timeout"
+          docker logs release_smoke
+          exit 1
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs release_smoke || true
+
+      - name: Log in to Docker Hub
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: kody06
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 2) Smoke test passed — push the amd64 image. Layers are reused from the
+      #    gha cache built in step 1, so this is nearly instant.
+      #    amd64-only: the fleet and QA boxes are x86_64. arm64 was ~11 min of
+      #    QEMU emulation for an image nothing in prod runs; Apple Silicon dev
+      #    runs the amd64 image via runtime emulation. Re-add linux/arm64 (and the
+      #    "Set up QEMU" step) if a native arm64 consumer ever appears.
+      - name: Build and push image
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "### Dry run OK — image built and booted, nothing pushed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Released to Docker Hub" >> "$GITHUB_STEP_SUMMARY"
+            echo "- \`${{ env.IMAGE }}:${{ steps.meta.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- \`${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Next: bump the tag in Leonardo's docker-compose.yml and open a PR — Leonardo CI validates the composition." >> "$GITHUB_STEP_SUMMARY"
+          fi

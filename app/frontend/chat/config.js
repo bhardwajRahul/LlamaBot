@@ -19,20 +19,20 @@ export const DEFAULT_CONFIG = {
 
   // Agent configuration
   agent: {
-    name: 'rails_frontend_starter_agent',
+    name: 'rails_beginner_agent',
     type: 'default'
   },
 
   // Agent mode mappings
   agentModes: {
-    prototype: 'rails_frontend_starter_agent',
     engineer: 'rails_agent',
     ai_builder: 'rails_ai_builder_agent',
     testing: 'rails_testing_agent',
-    feedback: 'rails_user_feedback_agent',
     ticket: 'rails_ticket_mode_agent',
-    architect: 'rails_architect_agent',
-    user: 'rails_user_mode_agent'
+    user: 'rails_user_mode_agent',
+    beginner: 'rails_beginner_agent',
+    pyxl: 'pyxl_agent',
+    plan: 'rails_plan_mode_agent'
   },
 
   // Streaming configuration

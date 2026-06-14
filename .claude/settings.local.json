@@ -60,9 +60,16 @@
       "Bash(timeout 30 python3:*)",
       "Bash(timeout 10 python3:*)",
       "Bash(docker system:*)",
-      "Bash(gh auth login --help:*)"
+      "Bash(gh auth login --help:*)",
+      "WebSearch",
+      "Bash(git -C /Users/kodykendall/SoftEngineering/LLMPress/LlamaBot diff app/agents/leonardo/rails_agent/middleware.py)",
+      "Bash(aws route53 *)",
+      "Read(//private/etc/**)"
     ],
     "deny": [],
-    "ask": []
+    "ask": [],
+    "additionalDirectories": [
+      "/Users/kodykendall/SoftEngineering/LLMPress/Leonardo/langgraph"
+    ]
   }
 }

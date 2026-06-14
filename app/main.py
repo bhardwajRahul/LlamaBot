@@ -29,7 +29,7 @@ from app.websocket.web_socket_connection_manager import WebSocketConnectionManag
 from app.websocket.request_handler import RequestHandler
 
 # Import routers
-from app.routers import ui, api, websocket, slash_commands, checkpoints, scheduled_jobs
+from app.routers import ui, api, websocket, slash_commands, checkpoints, scheduled_jobs, github_auth
 
 # Configure logging to write info-level events to both chat_app.log and stdout
 log_handlers = [logging.StreamHandler()]
@@ -39,7 +39,7 @@ except PermissionError:
     pass  # Skip file logging in environments without write permissions (e.g., CI)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=log_handlers
 )
@@ -47,14 +47,33 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Add CORS middleware for React frontend
+# Add CORS middleware for React frontend.
+#
+# Note: `allow_origins=["*"]` + `allow_credentials=True` is browser-rejected
+# for credentialed requests, so it never actually worked for cookies anyway.
+# With session cookies, the origin allowlist matters — configure it explicitly.
+allowed_origins_env = os.getenv("LLAMABOT_ALLOWED_ORIGINS", "").strip()
+if allowed_origins_env:
+    allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+else:
+    # Default: same-origin only. CORS doesn't apply to same-origin requests,
+    # so `[]` is the correct setting (rejects all cross-origin) without breaking
+    # anything that runs on the same host the API is served from.
+    allowed_origins = []
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for ngrok/external access
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if not os.getenv("LLAMAPRESS_AI_LOGIN_SECRET"):
+    logger.warning(
+        "LLAMAPRESS_AI_LOGIN_SECRET is not set. Magic-link sign-in "
+        "(GET /login?token=...) will return 503 until configured. "
+        "POST /login and HTTP Basic Auth still work."
+    )
 
 # Mount static directories
 frontend_dir = Path(__file__).parent / "frontend"
@@ -72,6 +91,10 @@ app.state.compiled_graphs = {}  # Cache for pre-compiled LangGraph workflows
 # Mothership integration for lease management
 app.state.mothership_client = MothershipClient()
 app.state.lease_manager = LeaseManager(app, app.state.mothership_client)
+
+# Paywall state cache, populated from mothership.report_message responses.
+# Shape: {"allowed_next": bool, "messages_remaining": int|None} — empty until first user message.
+app.state.paywall_credits = {}
 
 # Path to legacy auth file (for migration)
 LEGACY_AUTH_FILE = Path(__file__).parent / "auth.json"
@@ -181,6 +204,7 @@ app.include_router(websocket.router)
 app.include_router(slash_commands.router)
 app.include_router(checkpoints.router)
 app.include_router(scheduled_jobs.router)
+app.include_router(github_auth.router)
 
 
 async def graceful_shutdown(sig):
@@ -235,17 +259,6 @@ async def startup_event():
         except ImportError:
             logger.info("rails_ai_builder_agent not found, skipping")
 
-        try:
-            from app.agents.leonardo.rails_frontend_starter_agent.nodes import build_workflow as build_rails_frontend
-            app.state.compiled_graphs["rails_frontend_starter_agent"] = build_rails_frontend(checkpointer=checkpointer)
-        except ImportError:
-            logger.info("rails_frontend_starter_agent not found, skipping")
-
-        try:
-            from app.agents.leonardo.rails_user_feedback_agent.nodes import build_workflow as build_rails_user_feedback
-            app.state.compiled_graphs["rails_user_feedback_agent"] = build_rails_user_feedback(checkpointer=checkpointer)
-        except ImportError:
-            logger.info("rails_user_feedback_agent not found, skipping")
 
         try:
             from app.agents.leonardo.rails_ticket_mode_agent.nodes import build_workflow as build_rails_ticket_mode
@@ -264,6 +277,13 @@ async def startup_event():
             app.state.compiled_graphs["rails_user_mode_agent"] = build_rails_user_mode(checkpointer=checkpointer)
         except ImportError:
             logger.info("rails_user_mode_agent not found, skipping")
+
+
+        try:
+            from app.agents.leonardo.pyxl_agent.nodes import build_workflow as build_pyxl_agent
+            app.state.compiled_graphs["pyxl_agent"] = build_pyxl_agent(checkpointer=checkpointer)
+        except ImportError:
+            logger.info("pyxl_agent not found, skipping")
 
         logger.info(f"Compiled {len(app.state.compiled_graphs)} LangGraph workflows: {list(app.state.compiled_graphs.keys())}")
     except Exception as e:

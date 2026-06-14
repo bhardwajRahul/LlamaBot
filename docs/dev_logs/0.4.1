@@ -1,0 +1,108 @@
+0.4.1a:
+- [x] Improve auth system.
+- [x] Default to DeepSeek v4 Flash instead of Gemini 3.0 Flash.
+- [x] Add optional posthog configuration through .env file in chat.html
+
+0.4.1b: 
+- [x] Make deepseek & beginner mode the default.
+- [x] Improve beginner mode prompt by having Leonardo ask a follow up question.
+
+0.4.1c: 
+- [x] Improve default beginner prompt
+
+0.4.1d: 
+- [x] Create bootstrapping process. Improving prompts, memory, and identity creation.
+
+0.4.1e:
+- [x] Add auto backups
+
+0.4.1f:
+- [x] Fix permission issue with backups
+
+0.4.1g: 
+- [x] Add quick backup script instead of full backup
+
+0.4.1h: 
+- [x] Add prompt improvement for getting the URL the app is hosted at
+
+0.4.1i: 
+- [x] Add auto prompt
+
+0.4.1j:
+- [x] add suabgents and excel instructions
+
+0.4.1k:
+- [x] make prompt more proactive
+
+0.4.1l:
+- [x] Hide the dev tool calls when in beginner mode
+- [x] Add "Your App is Building" to always show in beginner mode
+- [x] Pin the chat window to latest message for better UX (so they don't have to click the purple arrow button constantly)
+- [x] Hide token context percentage wheel by default, and add setting to enable it for power users.
+- [x] Remove bootstrapping concept from beginner mode
+- [x] Improve Leonardo error handling
+- [x] Add auto send option on our iFrame communication layer
+
+0.4.1m:
+- [x] Add DeepSeek pro
+- [x] Add one page focus mode for excel to app
+- [x] Add new API routes
+
+0.4.1n:
+- [x] UX: Add welcome prompt with confetti
+
+0.4.1o:
+- [x] Fix UI issue where it doesn't carry along the welcome_prompt on login
+
+0.4.1p:
+- [x] Improve gh flow
+- [x] Improve beginner mode prompt with better instructions for using the bug button
+- [x] Add timezone info on backup history user interface
+- [x] Add telemetry for mothership
+- [x] Improve file user experience
+
+0.4.1q:
+- [x] Fix WS disconnect → orphan ToolMessage corruption (social-support-society incident). When the WS died mid-stream the astream loop kept consuming chunks, writing checkpoints with no observer and producing orphan ToolMessages that 400'd every subsequent request.
+- [x] Break astream loop on WS close in `request_handler.py` so the graph stops advancing once the client is gone (root-cause fix for the orphan)
+- [x] Extend `_repair_thread_state_if_needed` to detect and auto-heal orphan ToolMessages, not just dangling tool_calls
+- [x] Raise uvicorn ws keepalive to 60s/60s (was default 20s/20s) in Dockerfile + both Leonardo compose files
+- [x] Gate per-chunk `🍅` logging behind DEBUG via new `LOG_LEVEL` env var; reduces event-loop I/O pressure under streaming load
+- [x] Add `mothership_client.report_disconnect()` telemetry, fired when WS closes mid-stream — gives visibility into how often this happens without users having to file tickets
+- [x] Add `app/scripts/repair_thread.py` operational tool for inspecting/repairing corrupted thread checkpoints (dry-run by default, `--fix` to apply)
+- [x] Clean up redundant `logging.basicConfig` in `web_socket_connection_manager.py`
+
+0.4.1r: 
+- [x] Improve mothership & message counting
+
+0.4.1s:
+- [x] Add more scope permission in GitHub modal
+
+0.4.1t: 
+- [x] Fix /gh auth putting gh into the right place, and gh-copy.
+- [x] Add new tool for tail_rails_logs
+- [x] Add "fail open" approach on the LlamaPress Rails container so Leonardo can run Rails Server commands.
+- [x] Add better error handling & logging for Websocket Failure Events.
+
+0.4.1u:
+- [x] Attempt to fix DeepSeek token counting for auto-compaction/summarization
+- [x] Attempt to fix message token streaming not adding a new message bubble, and appending to the bottom of the last message even after there are thinking messages
+
+0.4.1v:
+- [x] Update prompt to tell users to email support@llamapress.ai
+- [x] Add auto retry on websocket lost connection error messages
+- [x] Re-add in the immediate message queue, where Leo will see a 2nd queued message immediately rather than after he's finished.
+
+0.4.1w: 
+- [x] Update prompt to have it build on the welcome page 
+- [x] Log LlamaBot version in JavaScript
+
+0.4.1x: 
+- [x] Improve beginner mode prompt
+
+0.4.1y:
+- [x] Add a soft rails restart (rm -f tmp/restart.txt && touch tmp/restart.txt) and hard rails restart that pipes our and restarts the docker llamapress container.
+
+0.4.1z:
+- [x] Prompt improvements: add instructions to also search through it's own memories when conducting research.
+- [x] Add fallback if the create ticket tool fails
+- [x] Improve the scheduled-jobs user interface.

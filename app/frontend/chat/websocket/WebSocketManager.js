@@ -16,6 +16,8 @@ export class WebSocketManager {
     this.reconnectTimer = null;
     this.isActionCable = false;
     this.isAuthenticated = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = config.maxReconnectAttempts ?? 5;
   }
 
   /**
@@ -36,11 +38,12 @@ export class WebSocketManager {
    */
   connectWebSocket() {
     const wsUrl = this.config.websocketUrl || getWebSocketUrl();
+    this.wsUrl = wsUrl;
     this.socket = new WebSocket(wsUrl);
     this.isActionCable = false;
 
     this.socket.onopen = () => this.handleOpen();
-    this.socket.onclose = () => this.handleClose();
+    this.socket.onclose = (event) => this.handleClose(event);
     this.socket.onerror = (error) => this.handleError(error);
     this.socket.onmessage = (event) => this.handleMessage(event);
 
@@ -68,7 +71,7 @@ export class WebSocketManager {
 
     // Set handlers
     this.socket.onopen = () => this.handleOpen();
-    this.socket.onclose = () => this.handleClose();
+    this.socket.onclose = (event) => this.handleClose(event);
     this.socket.onerror = (error) => this.handleError(error);
     this.socket.onmessage = (event) => this.handleMessage(event);
 
@@ -83,6 +86,7 @@ export class WebSocketManager {
    */
   handleOpen() {
     this.updateConnectionStatus(true);
+    this.reconnectAttempts = 0;
 
     if (this.elements.sendButton) {
       this.elements.sendButton.disabled = false;
@@ -117,15 +121,31 @@ export class WebSocketManager {
   /**
    * Handle WebSocket close event
    */
-  handleClose() {
+  handleClose(event) {
+    const closeInfo = event ? {
+      code: event.code,
+      reason: event.reason,
+      wasClean: event.wasClean,
+      url: this.wsUrl,
+      isActionCable: this.isActionCable,
+      attempt: this.reconnectAttempts,
+      maxAttempts: this.maxReconnectAttempts
+    } : {
+      url: this.wsUrl,
+      isActionCable: this.isActionCable,
+      attempt: this.reconnectAttempts,
+      maxAttempts: this.maxReconnectAttempts
+    };
+    console.warn('WebSocket closed:', closeInfo);
+
     this.updateConnectionStatus(false);
 
     if (this.elements.sendButton) {
       this.elements.sendButton.disabled = true;
     }
 
-    // Emit custom event
-    window.dispatchEvent(new CustomEvent('websocketDisconnected'));
+    // Emit custom event with close info
+    window.dispatchEvent(new CustomEvent('websocketDisconnected', { detail: closeInfo }));
 
     // Attempt to reconnect after delay
     this.scheduleReconnect();
@@ -133,9 +153,19 @@ export class WebSocketManager {
 
   /**
    * Handle WebSocket error event
+   *
+   * Note: the browser's WebSocket `error` event is intentionally opaque for
+   * security reasons — it carries no diagnostic detail. The real signal lives
+   * in the `close` event (`code` / `reason`) that fires immediately after.
    */
   handleError(error) {
-    console.error('WebSocket error:', error);
+    const readyState = this.socket ? this.socket.readyState : null;
+    console.error('WebSocket error:', {
+      url: this.wsUrl,
+      isActionCable: this.isActionCable,
+      readyState,
+      event: error
+    });
 
     // Emit custom event with error
     window.dispatchEvent(new CustomEvent('websocketError', { detail: error }));
@@ -222,6 +252,10 @@ export class WebSocketManager {
   /**
    * Schedule reconnection attempt
    * Note: ActionCable handles reconnection automatically
+   *
+   * Caps retries at `maxReconnectAttempts`. When exhausted, dispatches
+   * `websocketReconnectFailed` so the UI can show the "Lost connection"
+   * error only after we've truly given up — not on transient drops.
    */
   scheduleReconnect() {
     // ActionCable handles reconnection automatically, skip for ActionCable
@@ -229,10 +263,23 @@ export class WebSocketManager {
       return;
     }
 
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error(`WebSocket reconnect failed after ${this.reconnectAttempts} attempts`);
+      window.dispatchEvent(new CustomEvent('websocketReconnectFailed', {
+        detail: {
+          attempts: this.reconnectAttempts,
+          maxAttempts: this.maxReconnectAttempts,
+          url: this.wsUrl
+        }
+      }));
+      return;
+    }
+
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
     }
 
+    this.reconnectAttempts += 1;
     this.reconnectTimer = setTimeout(() => {
       this.connect();
     }, this.config.reconnectDelay || 3000);

@@ -148,6 +148,22 @@ class WebSocketHandler:
                                 }, self.websocket)
                         continue
 
+                    # Handle approval response (user approved/rejected a HITL tool call)
+                    if isinstance(json_data, dict) and json_data.get("type") == "approval_response":
+                        logger.info("APPROVAL_RESPONSE RECV")
+                        current_task = asyncio.create_task(
+                            self.request_handler.handle_approval_response(json_data, self.websocket)
+                        )
+                        continue
+
+                    # Handle question response (user answered a plan mode question)
+                    if isinstance(json_data, dict) and json_data.get("type") == "question_response":
+                        logger.info("QUESTION_RESPONSE RECV")
+                        current_task = asyncio.create_task(
+                            self.request_handler.handle_question_response(json_data, self.websocket)
+                        )
+                        continue
+
                     # For all other messages, check authentication
                     # First try to extract token from message (Rails gem pattern)
                     await self._check_auth_from_message(json_data)
@@ -167,7 +183,9 @@ class WebSocketHandler:
                                 logger.info(f"Unauthenticated WebSocket from {self.websocket.client} (auth not required)")
                                 auth_warning_sent = True
 
-                    # Cancel previous task if it exists and create new one
+                    # Cancel any in-flight task so the new message interrupts the agent.
+                    # Thread state corruption from mid-tool cancellation is repaired on the
+                    # next run by _repair_thread_state_if_needed in RequestHandler.
                     if current_task and not current_task.done():
                         logger.info("Cancelling previous task")
                         current_task.cancel()

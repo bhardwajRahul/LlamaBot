@@ -7,10 +7,13 @@ import { PlanMessageRenderer } from './PlanMessageRenderer.js';
 import { ToolIcons } from '../utils/icons.js';
 
 // Tools that should be expandable to show args and output
-const EXPANDABLE_TOOLS = ['grep_files', 'glob_files', 'bash_command', 'delegate_task'];
+const EXPANDABLE_TOOLS = ['grep_files', 'glob_files', 'bash_command', 'delegate_task', 'delegate_research'];
 
 // Tools that should be expandable but only show input args (no output)
 const INPUT_ONLY_EXPANDABLE_TOOLS = ['read_file', 'edit_file', 'write_file'];
+
+// Tools to SHOW in beginner/plan mode (everything else is hidden)
+const BEGINNER_VISIBLE_TOOLS = ['write_todos', 'delegate_task', 'delegate_research', 'web_search', 'web_fetch', 'ask_user_question', 'suggest_plan_mode'];
 
 export class ToolMessageRenderer {
   constructor(iframeManager = null, getRailsDebugInfoCallback = null) {
@@ -23,27 +26,70 @@ export class ToolMessageRenderer {
 
   /**
    * Create collapsible tool message HTML
+   * @param {string} toolName - Name of the tool
+   * @param {string} firstArgument - First argument for display
+   * @param {string} toolArgs - Tool arguments as JSON string
+   * @param {string} toolResult - Tool result (optional)
+   * @param {number} agentDepth - Depth of the agent (0 = main, 1+ = sub-agent)
    */
-  createCollapsibleToolMessage(toolName, firstArgument, toolArgs, toolResult) {
+  createCollapsibleToolMessage(toolName, firstArgument, toolArgs, toolResult, agentDepth = 0) {
     const uniqueId = generateUniqueId('tool');
+
+    // In beginner/plan mode, hide sub-agent tools AND non-visible tools
+    if (this._isBeginnerMode() || this._isPlanMode()) {
+      // Hide ALL sub-agent content (depth > 0) — keep the UI clean
+      if (agentDepth > 0) {
+        return `<div data-llamabot="tool-hidden" data-tool-name="${toolName}"></div>`;
+      }
+      // Hide non-visible main-agent tools
+      if (!BEGINNER_VISIBLE_TOOLS.includes(toolName)) {
+        return `<div data-llamabot="tool-hidden" data-tool-name="${toolName}"></div>`;
+      }
+    }
+
+    // ask_user_question, suggest_plan_mode, and offer_implementation are handled via WebSocket
+    // interrupt messages (question_request / suggest_mode_switch / implement_ticket), not as tool renders. Hide them here.
+    if (toolName === 'ask_user_question' || toolName === 'suggest_plan_mode' || toolName === 'offer_implementation') {
+      return `<div data-llamabot="tool-hidden" data-tool-name="${toolName}"></div>`;
+    }
 
     // Special rendering for different tool types
     if (toolName === 'write_todos') {
-      return this.renderTodoList(uniqueId, toolArgs);
+      return this.renderTodoList(uniqueId, toolArgs, agentDepth);
     }
 
     if (INPUT_ONLY_EXPANDABLE_TOOLS.includes(toolName)) {
-      return this.renderInputOnlyExpandable(uniqueId, toolName, firstArgument, toolArgs);
+      return this.renderInputOnlyExpandable(uniqueId, toolName, firstArgument, toolArgs, agentDepth);
     }
 
     // Default tool rendering
-    return this.renderDefaultTool(uniqueId, toolName, firstArgument, toolArgs, toolResult);
+    return this.renderDefaultTool(uniqueId, toolName, firstArgument, toolArgs, toolResult, agentDepth);
+  }
+
+  /**
+   * Render sub-agent badge HTML
+   * @param {number} depth - Agent depth (0 = main agent, 1+ = sub-agent)
+   * @returns {string} HTML for the badge, or empty string if main agent
+   */
+  _renderSubagentBadge(depth) {
+    if (depth === 0) return '';
+
+    // Show depth number only for depth > 1 (nested sub-agents)
+    const depthIndicator = depth > 1 ? `<span class="depth-num">${depth}</span>` : '';
+
+    return `
+      <span class="subagent-badge" data-depth="${depth}" title="Sub-agent depth ${depth}">
+        <svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="3" fill="currentColor"/></svg>
+        ${depthIndicator}
+      </span>
+    `;
   }
 
   /**
    * Render todo list tool using new plan-based renderer
+   * @param {number} agentDepth - Depth of the agent (0 = main, 1+ = sub-agent)
    */
-  renderTodoList(uniqueId, toolArgs) {
+  renderTodoList(uniqueId, toolArgs, agentDepth = 0) {
     const todos = JSON.parse(toolArgs)['todos'];
 
     // Use the new plan-based renderer for a sleeker UI
@@ -52,25 +98,30 @@ export class ToolMessageRenderer {
     return this.planRenderer.createPlanMessage(
       'Task Plan',
       todos,
-      { collapsible: true, showHeader: true }
+      { collapsible: true, showHeader: true, agentDepth }
     );
   }
 
   /**
    * Render tools that only show file path when expanded (no output)
    * Used for read_file, edit_file, etc.
+   * @param {number} agentDepth - Depth of the agent (0 = main, 1+ = sub-agent)
    */
-  renderInputOnlyExpandable(uniqueId, toolName, _firstArgument, toolArgs) {
+  renderInputOnlyExpandable(uniqueId, toolName, _firstArgument, toolArgs, agentDepth = 0) {
     const icon = ToolIcons.getIcon(toolName);
-    const displayName = this._formatToolName(toolName);
+    const baseName = this._formatToolName(toolName);
+    // Add emoji prefix for sub-agent tools
+    const displayName = agentDepth > 0 ? `🔹 ${baseName}` : baseName;
+    const subagentBadge = this._renderSubagentBadge(agentDepth);
 
     // Extract the file_path from args (more reliable than firstArgument for edit_file)
     const filePath = this._extractFilePath(toolArgs);
     const displayTarget = filePath ? this._extractFilename(filePath) : '';
 
     return `
-      <div data-llamabot="tool-expandable" data-tool-id="${uniqueId}" data-input-only="true" onclick="toggleToolExpand('${uniqueId}')">
-        <div data-llamabot="tool-compact" data-expandable="true">
+      <div data-llamabot="tool-expandable" data-tool-id="${uniqueId}" data-input-only="true" data-agent-depth="${agentDepth}" onclick="toggleToolExpand('${uniqueId}')">
+        <div data-llamabot="tool-compact" data-expandable="true" data-agent-depth="${agentDepth}">
+          ${subagentBadge}
           ${icon}
           <span data-llamabot="tool-compact-name">${displayName}</span>
           ${displayTarget ? `<span data-llamabot="tool-compact-target">${this._escapeHtml(displayTarget)}</span>` : ''}
@@ -101,24 +152,30 @@ export class ToolMessageRenderer {
   /**
    * Render default tool - minimal compact version
    * For expandable tools (Grep, Glob, Bash), make them clickable to show args/output
+   * @param {number} agentDepth - Depth of the agent (0 = main, 1+ = sub-agent)
    */
-  renderDefaultTool(uniqueId, toolName, firstArgument, toolArgs, toolResult) {
+  renderDefaultTool(uniqueId, toolName, firstArgument, toolArgs, toolResult, agentDepth = 0) {
     const icon = ToolIcons.getIcon(toolName);
-    const displayName = this._formatToolName(toolName);
-    const displayTarget = firstArgument ? this._extractFilename(firstArgument) : '';
+    const baseName = this._formatToolName(toolName);
+    // Add emoji prefix for sub-agent tools
+    const displayName = agentDepth > 0 ? `🔹 ${baseName}` : baseName;
+    const displayTarget = this._extractDisplayTarget(toolName, firstArgument);
     const isExpandable = EXPANDABLE_TOOLS.includes(toolName);
+    const subagentBadge = this._renderSubagentBadge(agentDepth);
 
     if (isExpandable) {
       // Store the tool data for later retrieval
       this.toolDataStore.set(uniqueId, {
         toolName,
         toolArgs,
-        toolResult: toolResult || ''
+        toolResult: toolResult || '',
+        agentDepth
       });
 
       return `
-        <div data-llamabot="tool-expandable" data-tool-id="${uniqueId}" onclick="toggleToolExpand('${uniqueId}')">
-          <div data-llamabot="tool-compact" data-expandable="true">
+        <div data-llamabot="tool-expandable" data-tool-id="${uniqueId}" data-agent-depth="${agentDepth}" onclick="toggleToolExpand('${uniqueId}')">
+          <div data-llamabot="tool-compact" data-expandable="true" data-agent-depth="${agentDepth}">
+            ${subagentBadge}
             ${icon}
             <span data-llamabot="tool-compact-name">${displayName}</span>
             ${displayTarget ? `<span data-llamabot="tool-compact-target">${this._escapeHtml(displayTarget)}</span>` : ''}
@@ -139,7 +196,8 @@ export class ToolMessageRenderer {
     }
 
     return `
-      <div data-llamabot="tool-compact">
+      <div data-llamabot="tool-compact" data-agent-depth="${agentDepth}">
+        ${subagentBadge}
         ${icon}
         <span data-llamabot="tool-compact-name">${displayName}</span>
         ${displayTarget ? `<span data-llamabot="tool-compact-target">${this._escapeHtml(displayTarget)}</span>` : ''}
@@ -177,6 +235,45 @@ export class ToolMessageRenderer {
     // Handle both forward and backward slashes
     const parts = path.replace(/\\/g, '/').split('/');
     return parts[parts.length - 1];
+  }
+
+  /**
+   * Extract display target based on tool type
+   * For delegate tools, show truncated task description
+   * For file tools, show filename
+   * For bash, clean up command
+   */
+  _extractDisplayTarget(toolName, firstArgument) {
+    if (!firstArgument) return '';
+
+    // For delegate tools, truncate the task description
+    if (toolName === 'delegate_task' || toolName === 'delegate_research') {
+      const maxLength = 60;
+      if (firstArgument.length > maxLength) {
+        return firstArgument.substring(0, maxLength) + '...';
+      }
+      return firstArgument;
+    }
+
+    // For other tools, use existing filename extraction
+    return this._extractFilename(firstArgument);
+  }
+
+  /**
+   * Check if the current agent mode is beginner
+   */
+  _isBeginnerMode() {
+    const modeSelect = document.querySelector('[data-llamabot="agent-mode-select"]');
+    console.log('[ToolRenderer] mode select value:', modeSelect?.value);
+    return modeSelect?.value === 'beginner';
+  }
+
+  /**
+   * Check if the current execution mode is plan
+   */
+  _isPlanMode() {
+    const savedMode = document.cookie.split(';').find(c => c.trim().startsWith('executionMode='));
+    return savedMode?.split('=')?.[1]?.trim() === 'plan';
   }
 
   /**
@@ -258,6 +355,16 @@ export class ToolMessageRenderer {
 
     // Handle input-only expandable tools (read_file, edit_file) - just update status
     if (INPUT_ONLY_EXPANDABLE_TOOLS.includes(baseMessage.name)) {
+      // Refresh iframe on edit/write success (gated on user preference, defaults to enabled).
+      // Still fires even if tool is hidden in beginner mode.
+      const autoRefreshOnEdit = localStorage.getItem('autoRefreshOnEdit') !== 'false';
+      if (autoRefreshOnEdit &&
+          (baseMessage.name === 'edit_file' || baseMessage.name === 'write_file') &&
+          baseMessage.artifact?.status === 'success' &&
+          this.iframeManager && this.getRailsDebugInfoCallback) {
+        this.iframeManager.refreshRailsApp(this.getRailsDebugInfoCallback);
+      }
+
       const expandableDiv = messageDiv.querySelector('[data-llamabot="tool-expandable"]');
       if (expandableDiv) {
         const toolCompact = expandableDiv.querySelector('[data-llamabot="tool-compact"]');
@@ -269,8 +376,9 @@ export class ToolMessageRenderer {
               icon.outerHTML = ToolIcons.successIcon();
             }
 
-            // Refresh the main iframe when edit_file or write_file succeeds
-            if ((baseMessage.name === 'edit_file' || baseMessage.name === 'write_file') &&
+            // Refresh the main iframe when edit_file or write_file succeeds (gated on user preference)
+            if (localStorage.getItem('autoRefreshOnEdit') !== 'false' &&
+                (baseMessage.name === 'edit_file' || baseMessage.name === 'write_file') &&
                 this.iframeManager && this.getRailsDebugInfoCallback) {
               this.iframeManager.refreshRailsApp(this.getRailsDebugInfoCallback);
             }
@@ -318,3 +426,8 @@ window.toggleToolExpand = function(toolId) {
     expandableDiv.classList.toggle('expanded');
   }
 };
+
+// Note: ask_user_question and suggest_plan_mode are now handled via WebSocket
+// interrupt messages (question_request / suggest_mode_switch) in MessageHandler.js,
+// not as tool card renders. The old window.answerQuestion and window.switchToPlanMode
+// functions have been removed.

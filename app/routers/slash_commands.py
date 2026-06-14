@@ -1,8 +1,11 @@
 """Slash Commands API for executing host scripts."""
 
+import json
 import logging
 import subprocess
 import os
+import uuid
+import threading
 from datetime import datetime
 from typing import List, Optional
 
@@ -86,10 +89,17 @@ SLASH_COMMANDS = {
     },
     "chown": {
         "script": None,  # Direct command
-        "command": "chown -R $(id -u):$(id -g) .",
+        "command": "echo 'Host: '$(hostname) && echo 'User: '$(id -un)'('$(id -u)':'$(id -g)')' && echo 'Dir: '$(pwd) && echo '---' && chown -R $(id -u):$(id -g) . 2>&1 && echo 'OK: ownership updated.' || echo 'FAILED: chown error (see above)'",
         "description": "Fix file ownership permissions",
         "dangerous": True,
         "confirm_message": "This will change ownership of all files to current user. Continue?"
+    },
+    "debug": {
+        "script": None,
+        "command": "echo 'hostname: '$(hostname) && echo 'whoami: '$(whoami) && echo 'id: '$(id) && echo 'pwd: '$(pwd) && echo 'uname: '$(uname -a) && echo 'pid 1: '$(cat /proc/1/cmdline 2>/dev/null | tr '\\0' ' ' || echo 'N/A') && echo 'ls -la (first 10):' && ls -la | head -10",
+        "description": "Show debug info about execution environment (host vs container)",
+        "dangerous": False,
+        "confirm_message": "Show system debug info?"
     },
     "truncate-checkpoints": {
         "script": "bin/db/truncate_checkpoints.sh",
@@ -103,14 +113,6 @@ SLASH_COMMANDS = {
         "dangerous": True,
         "confirm_message": "This will restart the application. You may lose your connection briefly. Continue?"
     },
-    "bash": {
-        "script": None,
-        "command": None,  # Uses args from request
-        "description": "Run a custom bash command",
-        "dangerous": True,
-        "confirm_message": "This will execute a custom bash command. Continue?",
-        "accepts_args": True
-    },
     "history": {
         "script": None,
         "command": None,
@@ -121,11 +123,12 @@ SLASH_COMMANDS = {
     },
     "gh": {
         "script": None,
-        "command": "timeout 3 gh auth login -p https -h github.com -w 2>&1 || true",
-        "description": "Authenticate with GitHub (opens browser)",
+        "command": None,
+        "description": "Authenticate with GitHub",
         "dangerous": False,
-        "confirm_message": "This will start GitHub authentication. A browser tab will open and the code will be copied to your clipboard. Continue?",
-        "special_handler": "gh_auth"  # Frontend handles code copy + URL open
+        "confirm_message": None,
+        "client_only": True,
+        "special_handler": "gh_auth_modal"  # Frontend opens GitHub auth modal
     },
     "gh-copy": {
         "script": None,
@@ -192,6 +195,7 @@ def execute_command(command: str, timeout: int = 300) -> subprocess.CompletedPro
     """
     if is_native_linux_host():
         # Linux production: use nsenter to run on host
+        logger.info(f"Executing on HOST via nsenter: {command[:100]}")
         nsenter_cmd = [
             "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
             "--", "/bin/bash", "-c", f"cd {HOST_LEONARDO_PATH} && {command}"
@@ -205,6 +209,7 @@ def execute_command(command: str, timeout: int = 300) -> subprocess.CompletedPro
     else:
         # macOS dev (or any non-Linux): run directly in container
         # Leonardo is mounted at LEONARDO_PATH (/app/leonardo)
+        logger.info(f"Executing IN CONTAINER (nsenter unavailable): {command[:100]}")
         return subprocess.run(
             ["bash", "-c", command],
             capture_output=True,
@@ -244,7 +249,8 @@ def execute_host_command(cmd_config: dict, args: Optional[str] = None) -> dict:
         elif cmd_config.get("command"):
             # Execute a predefined direct command
             command = cmd_config["command"]
-            result = execute_command(command, timeout=60)
+            timeout = cmd_config.get("timeout", 60)  # Use custom timeout if specified
+            result = execute_command(command, timeout=timeout)
 
         else:
             return {
@@ -398,3 +404,100 @@ async def get_command_history(
         }
         for entry in history
     ]
+
+
+# --- Auto-backup on completion ---
+
+_backup_status = {}  # {backup_id: {"status": "running"|"completed"|"failed", "error": str|None}}
+BACKUP_HISTORY_FILE = os.path.join(LEONARDO_PATH, "logs", "backup_history.json")
+
+
+def _log_backup_result(backup_id: str, status: str, error: str = None, stdout: str = None):
+    """Append backup result to persistent history file."""
+    try:
+        os.makedirs(os.path.dirname(BACKUP_HISTORY_FILE), exist_ok=True)
+        history = []
+        if os.path.exists(BACKUP_HISTORY_FILE):
+            with open(BACKUP_HISTORY_FILE, "r") as f:
+                history = json.load(f)
+        history.append({
+            "id": backup_id,
+            "status": status,
+            "error": error,
+            "stdout": (stdout or "")[-2000:],
+            "timestamp": datetime.now(tz=__import__('zoneinfo').ZoneInfo('America/Los_Angeles')).isoformat()
+        })
+        # Keep last 100 entries
+        history = history[-100:]
+        with open(BACKUP_HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to log backup result: {e}")
+
+
+def _run_backup_in_background(backup_id: str):
+    """Run master_backup_all.sh in a background thread."""
+    instance_name = os.getenv("INSTANCE_NAME", "")
+    s3_bucket = os.getenv("S3_BUCKET_PATH", "")
+    project_dir = HOST_LEONARDO_PATH
+
+    command = f"chmod +x bin/backups/cloud/*.sh && bash bin/backups/cloud/quick_backup.sh {instance_name} {s3_bucket} {project_dir}"
+    try:
+        result = execute_command(command, timeout=600)
+        if result.returncode == 0:
+            _backup_status[backup_id] = {"status": "completed", "error": None}
+            _log_backup_result(backup_id, "completed", stdout=result.stdout)
+        else:
+            error = result.stderr[:500] if result.stderr else "Unknown error"
+            _backup_status[backup_id] = {"status": "failed", "error": error}
+            _log_backup_result(backup_id, "failed", error=error, stdout=result.stdout)
+    except Exception as e:
+        error = str(e)[:500]
+        _backup_status[backup_id] = {"status": "failed", "error": error}
+        _log_backup_result(backup_id, "failed", error=error)
+    finally:
+        # Clean up old statuses (keep only last 10)
+        if len(_backup_status) > 10:
+            oldest_keys = list(_backup_status.keys())[:-10]
+            for k in oldest_keys:
+                _backup_status.pop(k, None)
+
+
+@router.post("/api/auto-backup", response_class=JSONResponse)
+async def trigger_auto_backup(current_user: User = Depends(auth)):
+    """Trigger a non-blocking backup on task completion."""
+    instance_name = os.getenv("INSTANCE_NAME", "")
+    s3_bucket = os.getenv("S3_BUCKET_PATH", "")
+
+    if not instance_name or not s3_bucket:
+        return {"status": "skipped", "reason": "INSTANCE_NAME or S3_BUCKET_PATH not configured"}
+
+    backup_id = str(uuid.uuid4())[:8]
+    _backup_status[backup_id] = {"status": "running", "error": None}
+
+    thread = threading.Thread(target=_run_backup_in_background, args=(backup_id,), daemon=True)
+    thread.start()
+
+    return {"status": "started", "backup_id": backup_id}
+
+
+@router.get("/api/auto-backup/{backup_id}/status", response_class=JSONResponse)
+async def get_backup_status(backup_id: str, current_user: User = Depends(auth)):
+    """Check the status of a running backup."""
+    status = _backup_status.get(backup_id)
+    if not status:
+        return {"status": "unknown"}
+    return status
+
+
+@router.get("/api/auto-backup/history", response_class=JSONResponse)
+async def get_backup_history(current_user: User = Depends(auth)):
+    """Get persistent backup history."""
+    try:
+        if os.path.exists(BACKUP_HISTORY_FILE):
+            with open(BACKUP_HISTORY_FILE, "r") as f:
+                history = json.load(f)
+            return list(reversed(history))  # Most recent first
+        return []
+    except Exception:
+        return []

@@ -39,3 +39,45 @@
 0.4.0c: 
 - [x] Improve prompt to explain sub-agent delegation concept
 - [x] Supress Ruby/Rails env info on the bash tool
+
+0.4.0d:
+- [x] Fix error with prompt library to save prompts over 10,000 characters
+
+0.4.0e:
+- [x] Add prompt improvements surrounding the bash tool call
+
+0.4.0f: 
+- [x] Fix prompt for test mode
+
+0.4.0g:
+- [x] Add skills into prompt
+- [x] Add timer for tasks 
+- [x] Add sub-agent visual indicator to tool calls
+
+0.4.0h: 
+- [x] Add copy button for code blocks in Leonardo messages
+- [x] Improve testing ability with prompts by specifying how to handle tests in ticket mode and engineering mode
+
+0.4.0i: 
+- [x] Add instructions for handling multi-image attachments in engineer mode for Rails 7.1 active storage attachments, (not clearing out existing files upon form submission)
+- [x] Fix agent mode UI sync bug (race condition), where it can sometimes run in a different agent mode from what the UI is showing
+
+0.4.0j:
+- [x] Add internet search tool into our research sub-agent delegate_research.
+- [x] Improve prompts so Leonardo doesn't delete existing rspec tests before hand. It also shouldn't have deleted these tests after creating it - we want these new additions to prevent regressions/bugs in the future - these tests are gold.
+
+0.4.0k: 
+- [x] Remove git tools so Leonardo won't auto commit things 
+- [x] Improve prompts.
+- [x] Fix the gh-copy slash command not working.
+- [x] Add warning to not duplicate database columns (normalization best practices in db design) in both engineering & ticket mode
+
+0.4.0l: 
+- [x] Add memory
+- [x] Add stop button
+- [x] Add plan & ask mode
+
+0.4.0m: 
+- [x] Update DeepSeek to v4 Flash 
+- [x] Auto remove the broken messages in between the tool calls to fix the 400 error - tool calls must be followed by tool messages (Non Gemini models threads lock in this state if this happens)
+- [x] Improve Database Mode and make the memory more proactive for database mode

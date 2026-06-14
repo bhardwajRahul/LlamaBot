@@ -26,6 +26,28 @@ from app.agents.leonardo.rails_agent.tool_prompts import (
     GIT_COMMIT_DESCRIPTION,
     GIT_COMMAND_DESCRIPTION,
     GITHUB_CLI_DESCRIPTION,
+    SAVE_MEMORY_DESCRIPTION,
+    LIST_MEMORIES_DESCRIPTION,
+    DELETE_MEMORY_DESCRIPTION,
+    READ_LEONARDO_MD_DESCRIPTION,
+    EDIT_LEONARDO_MD_DESCRIPTION,
+    WRITE_LEONARDO_MD_DESCRIPTION,
+    TAIL_RAILS_LOGS_DESCRIPTION,
+    HARD_RESTART_RAILS_DESCRIPTION,
+    FIX_PERMISSIONS_DESCRIPTION,
+)
+
+from app.agents.leonardo.project_context import (
+    LEONARDO_MD_PATH,
+    SOUL_MD_PATH,
+    USER_MD_PATH,
+    IDENTITY_MD_PATH,
+)
+
+from app.agents.leonardo.memory import (
+    write_memory_file,
+    list_all_memories,
+    delete_memory_file,
 )
 
 from app.agents.leonardo.rails_agent.state import Todo
@@ -782,8 +804,17 @@ def get_rails_container_name():
 # Initialize container name at module load (used by capture_rails_logs)
 RAILS_CONT = get_rails_container_name()
 
-def rails_api_sh(snippet: str, workdir: str = WORKDIR) -> str:
-    """Execute a command in the Rails Docker container via Docker API."""
+def rails_api_sh(snippet: str, workdir: str = WORKDIR, timeout_seconds: int = 60) -> str:
+    """Execute a command in the Rails Docker container via Docker API.
+
+    Args:
+        snippet: The bash command to execute
+        workdir: Working directory inside the container
+        timeout_seconds: Maximum time to wait for command completion (default 60, max 600)
+    """
+    # Clamp timeout to reasonable bounds (30 seconds minimum to 10 minutes max)
+    timeout_seconds = max(30, min(timeout_seconds, 600))
+
     try:
         # Get container name dynamically (handles restarts and varying prefixes)
         container_name = get_rails_container_name()
@@ -832,7 +863,7 @@ def rails_api_sh(snippet: str, workdir: str = WORKDIR) -> str:
             f"http://localhost/exec/{exec_id}/start"
         ]
         
-        start_result = subprocess.run(start_cmd, capture_output=True, text=True, timeout=60)
+        start_result = subprocess.run(start_cmd, capture_output=True, text=True, timeout=timeout_seconds)
         if start_result.returncode != 0:
             return f"START-EXEC ERROR: {start_result.stderr or start_result.stdout}"
         
@@ -905,11 +936,240 @@ def capture_rails_logs(duration: int = 10, output_file: str = None) -> str:
     return str(full_path)
 
 
+def _demultiplex_docker_log_stream(raw: bytes) -> str:
+    """Decode Docker's log stream into plain text.
+
+    Docker uses two formats depending on whether the container has a TTY:
+    - non-TTY: each frame is 8 bytes [stream_type, 0, 0, 0, size(4 BE)] + payload
+    - TTY:     raw stream, no framing
+    Auto-detect by looking at the first byte (\\x01 = stdout, \\x02 = stderr).
+    """
+    if not raw:
+        return ""
+    if raw[:1] in (b"\x01", b"\x02"):
+        parts: list[str] = []
+        i = 0
+        while i + 8 <= len(raw):
+            size = int.from_bytes(raw[i + 4:i + 8], "big")
+            if i + 8 + size > len(raw):
+                break
+            parts.append(raw[i + 8:i + 8 + size].decode("utf-8", errors="replace"))
+            i += 8 + size
+        return "".join(parts)
+    return raw.decode("utf-8", errors="replace")
+
+
+@tool(description=TAIL_RAILS_LOGS_DESCRIPTION)
+def tail_rails_logs(
+    runtime: ToolRuntime,
+    lines: int = 200,
+) -> Command:
+    """Read recent stdout/stderr from the Rails container (works on stopped containers)."""
+    tool_call_id = runtime.tool_call_id
+
+    try:
+        lines = max(1, min(int(lines), 2000))
+    except (TypeError, ValueError):
+        lines = 200
+
+    try:
+        container_name = get_rails_container_name()
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Could not resolve Rails container name: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+    cmd = [
+        "curl", "--silent", "--show-error",
+        "--unix-socket", "/var/run/docker.sock",
+        f"http://localhost/containers/{container_name}/logs?stdout=true&stderr=true&tail={lines}",
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return Command(
+            update={
+                "messages": [ToolMessage("Timed out reading Rails container logs.", tool_call_id=tool_call_id)]
+            }
+        )
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Error reading Rails container logs: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+    if result.returncode != 0:
+        stderr_text = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else str(result.stderr)
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Docker logs API error (container={container_name}): {stderr_text}", tool_call_id=tool_call_id)]
+            }
+        )
+
+    logs_text = _demultiplex_docker_log_stream(result.stdout)
+    logs_text = truncate_output(logs_text, BASH_OUTPUT_MAX_CHARS)
+    if not logs_text.strip():
+        logs_text = "(no recent log output)"
+
+    header = f"Recent Rails container logs ({container_name}, last {lines} lines):\n"
+    return Command(
+        update={
+            "messages": [ToolMessage(header + logs_text, tool_call_id=tool_call_id)]
+        }
+    )
+
+
+@tool(description=HARD_RESTART_RAILS_DESCRIPTION)
+def hard_restart_rails(
+    runtime: ToolRuntime,
+) -> Command:
+    """Forcefully restart the Rails container via the Docker socket.
+
+    Equivalent to `docker compose restart llamapress` — kills the Rails process
+    (SIGTERM, then SIGKILL after the timeout) and starts the same container
+    fresh. Does NOT recreate the container from docker-compose.yml.
+    """
+    tool_call_id = runtime.tool_call_id
+
+    try:
+        container_name = get_rails_container_name()
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Could not resolve Rails container name: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+    cmd = [
+        "curl", "--silent", "--show-error", "--fail-with-body",
+        "-X", "POST",
+        "--unix-socket", "/var/run/docker.sock",
+        f"http://localhost/containers/{container_name}/restart?t=10",
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return Command(
+            update={
+                "messages": [ToolMessage(
+                    f"Restart of {container_name} did not complete within 60s. "
+                    "The container may still be coming back up — check `tail_rails_logs` in a moment.",
+                    tool_call_id=tool_call_id,
+                )]
+            }
+        )
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Error calling Docker restart API: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+    if result.returncode != 0:
+        return Command(
+            update={
+                "messages": [ToolMessage(
+                    f"Docker restart API error (container={container_name}): "
+                    f"{(result.stderr or result.stdout or '').strip()}",
+                    tool_call_id=tool_call_id,
+                )]
+            }
+        )
+
+    return Command(
+        update={
+            "messages": [ToolMessage(
+                f"Hard restart of {container_name} kicked off. The Rails app will be unreachable for a few "
+                "seconds while it boots back up. Tell the user the page will reload automatically — do not "
+                "ask them to refresh. If you need to verify it came back, wait ~10s, then call "
+                "`tail_rails_logs` to confirm Puma logged 'Listening on'.",
+                tool_call_id=tool_call_id,
+            )]
+        }
+    )
+
+
+@tool(description=FIX_PERMISSIONS_DESCRIPTION)
+def fix_permissions(
+    runtime: ToolRuntime,
+) -> Command:
+    """Fix file permission issues in the Rails container by chowning problematic directories as root."""
+    tool_call_id = runtime.tool_call_id
+
+    try:
+        container_name = get_rails_container_name()
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Could not resolve Rails container name: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+    # Exec as root (no User field) to chown directories back to UID 1000
+    cmd_str = (
+        "chown -R 1000:1000 /rails/tmp /rails/coverage /rails/log 2>/dev/null; "
+        "echo 'Permissions fixed successfully'"
+    )
+    payload = {
+        "AttachStdout": True,
+        "AttachStderr": True,
+        "Tty": True,
+        "Cmd": ["/bin/sh", "-c", cmd_str],
+    }
+
+    # Create exec instance
+    create_cmd = [
+        "curl", "--silent", "--show-error", "--fail-with-body",
+        "--unix-socket", "/var/run/docker.sock",
+        "-H", "Content-Type: application/json",
+        "--data-binary", json.dumps(payload),
+        f"http://localhost/containers/{container_name}/exec",
+    ]
+
+    try:
+        create_result = subprocess.run(create_cmd, capture_output=True, text=True, timeout=30)
+        if create_result.returncode != 0:
+            return Command(update={"messages": [ToolMessage(f"Failed to create exec: {create_result.stderr or create_result.stdout}", tool_call_id=tool_call_id)]})
+
+        exec_data = json.loads(create_result.stdout)
+        exec_id = exec_data["Id"]
+
+        # Start exec
+        start_cmd = [
+            "curl", "--silent", "--show-error",
+            "--unix-socket", "/var/run/docker.sock",
+            "-H", "Content-Type: application/json",
+            "--data-binary", json.dumps({"Detach": False, "Tty": True}),
+            f"http://localhost/exec/{exec_id}/start",
+        ]
+        start_result = subprocess.run(start_cmd, capture_output=True, text=True, timeout=60)
+        output = start_result.stdout.strip()
+
+        return Command(
+            update={
+                "messages": [ToolMessage(
+                    f"Permission fix completed on {container_name}:\n{output}\n\n"
+                    "Directories /rails/tmp, /rails/coverage, and /rails/log have been chowned to 1000:1000. "
+                    "You can now retry the command that failed with permission errors.",
+                    tool_call_id=tool_call_id,
+                )]
+            }
+        )
+    except Exception as e:
+        return Command(update={"messages": [ToolMessage(f"Error fixing permissions: {e}", tool_call_id=tool_call_id)]})
+
+
 @tool(description=BASH_COMMAND_FOR_RAILS_DESCRIPTION)
 def bash_command(
     command: str,
     runtime: ToolRuntime,
     workdir: str = WORKDIR,
+    timeout_seconds: int = 60,
 ) -> Command:
     """Execute a bash command in the Rails container."""
     tool_call_id = runtime.tool_call_id
@@ -926,7 +1186,7 @@ def bash_command(
                 }
             )
 
-    raw_result = rails_api_sh(command, workdir)
+    raw_result = rails_api_sh(command, workdir, timeout_seconds)
 
     # Truncate large outputs to prevent context window explosion
     result = truncate_output(raw_result, BASH_OUTPUT_MAX_CHARS)
@@ -940,9 +1200,8 @@ def bash_command(
         error_guidance = (
             "\n\n<CRITICAL_ERROR>\n"
             f"Detected critical error patterns: {', '.join(matched_patterns[:3])}\n"
-            "This error likely CANNOT be fixed from inside the container.\n"
-            "STOP trying to fix this with chmod/chown - these won't work on mounted volumes.\n"
-            "Tell the user this is a host permission issue and ask them to contact a LlamaPress admin.\n"
+            "This is a file permission issue. Use the fix_permissions tool to resolve it, then retry your command.\n"
+            "Do NOT try chmod/chown via bash_command — it runs as UID 1000 which can't fix root-owned files.\n"
             "</CRITICAL_ERROR>"
         )
         message_content = f"Command output:\n{result}{error_guidance}"
@@ -1615,6 +1874,266 @@ def edit_agent_file(
             "messages": [ToolMessage(success_message, artifact=tool_output, tool_call_id=tool_call_id)]
         }
     )
+
+# ============================================================================
+# MEMORY TOOLS - Persistent memory across conversations
+# ============================================================================
+
+@tool(description=SAVE_MEMORY_DESCRIPTION)
+def save_memory(
+    name: str,
+    description: str,
+    memory_type: str,
+    content: str,
+    runtime: ToolRuntime,
+) -> Command:
+    """Save information to long-term memory."""
+    tool_call_id = runtime.tool_call_id
+
+    try:
+        filename = write_memory_file(name, description, memory_type, content)
+        success_message = f"Memory saved: {filename}"
+        return Command(
+            update={
+                "messages": [ToolMessage(success_message, tool_call_id=tool_call_id)]
+            }
+        )
+    except ValueError as e:
+        error_message = f"Error saving memory: {e}"
+        return Command(
+            update={
+                "messages": [ToolMessage(error_message, tool_call_id=tool_call_id)]
+            }
+        )
+    except Exception as e:
+        error_message = f"Unexpected error saving memory: {e}"
+        return Command(
+            update={
+                "messages": [ToolMessage(error_message, tool_call_id=tool_call_id)]
+            }
+        )
+
+
+@tool(description=LIST_MEMORIES_DESCRIPTION)
+def list_memories(
+    runtime: ToolRuntime,
+) -> Command:
+    """List all saved memories."""
+    tool_call_id = runtime.tool_call_id
+
+    memories = list_all_memories()
+
+    if not memories:
+        return Command(
+            update={
+                "messages": [ToolMessage("No memories saved yet.", tool_call_id=tool_call_id)]
+            }
+        )
+
+    lines = [f"Found {len(memories)} saved memories:\n"]
+    for mem in memories:
+        lines.append(f"### {mem['name']} (type: {mem['type']}, file: {mem['filename']})")
+        lines.append(f"_{mem['description']}_")
+        lines.append(f"{mem['content']}\n")
+
+    return Command(
+        update={
+            "messages": [ToolMessage("\n".join(lines), tool_call_id=tool_call_id)]
+        }
+    )
+
+
+@tool(description=DELETE_MEMORY_DESCRIPTION)
+def delete_memory(
+    filename: str,
+    runtime: ToolRuntime,
+) -> Command:
+    """Delete a memory by filename."""
+    tool_call_id = runtime.tool_call_id
+
+    if delete_memory_file(filename):
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Memory deleted: {filename}", tool_call_id=tool_call_id)]
+            }
+        )
+    else:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Memory not found: {filename}", tool_call_id=tool_call_id)]
+            }
+        )
+
+
+# ============================================================================
+# LEONARDO.MD TOOLS - Read/edit the project context file
+# ============================================================================
+
+@tool(description=READ_LEONARDO_MD_DESCRIPTION)
+def read_leonardo_md(
+    runtime: ToolRuntime,
+) -> Command:
+    """Read the LEONARDO.md project context file."""
+    tool_call_id = runtime.tool_call_id
+    filepath = Path(LEONARDO_MD_PATH)
+
+    if not filepath.exists():
+        return Command(
+            update={
+                "messages": [ToolMessage("LEONARDO.md does not exist yet. Use write_leonardo_md to create it.", tool_call_id=tool_call_id)]
+            }
+        )
+
+    try:
+        content = filepath.read_text(encoding="utf-8")
+        if not content.strip():
+            return Command(
+                update={
+                    "messages": [ToolMessage("LEONARDO.md exists but is empty.", tool_call_id=tool_call_id)]
+                }
+            )
+
+        # Add line numbers
+        lines = content.splitlines()
+        numbered = [f"{i+1:6d}\t{line}" for i, line in enumerate(lines)]
+        result = f"Contents of LEONARDO.md ({len(lines)} lines):\n\n" + "\n".join(numbered)
+
+        return Command(
+            update={
+                "messages": [ToolMessage(result, tool_call_id=tool_call_id)]
+            }
+        )
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Error reading LEONARDO.md: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+
+@tool(description=EDIT_LEONARDO_MD_DESCRIPTION)
+def edit_leonardo_md(
+    old_string: str,
+    new_string: str,
+    runtime: ToolRuntime,
+) -> Command:
+    """Edit the LEONARDO.md project context file by replacing text."""
+    tool_call_id = runtime.tool_call_id
+    filepath = Path(LEONARDO_MD_PATH)
+
+    if not filepath.exists():
+        return Command(
+            update={
+                "messages": [ToolMessage("Error: LEONARDO.md does not exist. Use write_leonardo_md to create it.", tool_call_id=tool_call_id)]
+            }
+        )
+
+    try:
+        content = filepath.read_text(encoding="utf-8")
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Error reading LEONARDO.md: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+    if old_string not in content:
+        return Command(
+            update={
+                "messages": [ToolMessage("Error: Could not find the specified text in LEONARDO.md. Read the file first to see exact contents.", tool_call_id=tool_call_id)]
+            }
+        )
+
+    if content.count(old_string) > 1:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Error: The text to replace appears {content.count(old_string)} times. Provide more context to make it unique.", tool_call_id=tool_call_id)]
+            }
+        )
+
+    new_content = content.replace(old_string, new_string, 1)
+    filepath.write_text(new_content, encoding="utf-8")
+
+    return Command(
+        update={
+            "messages": [ToolMessage("Successfully edited LEONARDO.md.", tool_call_id=tool_call_id)]
+        }
+    )
+
+
+@tool(description=WRITE_LEONARDO_MD_DESCRIPTION)
+def write_leonardo_md(
+    content: str,
+    runtime: ToolRuntime,
+) -> Command:
+    """Create or overwrite the LEONARDO.md project context file."""
+    tool_call_id = runtime.tool_call_id
+    filepath = Path(LEONARDO_MD_PATH)
+
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(content, encoding="utf-8")
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Successfully wrote LEONARDO.md ({len(content)} chars).", tool_call_id=tool_call_id)]
+            }
+        )
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Error writing LEONARDO.md: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+
+VALID_PERSONALITY_FILES = {
+    "SOUL.md": SOUL_MD_PATH,
+    "USER.md": USER_MD_PATH,
+    "IDENTITY.md": IDENTITY_MD_PATH,
+}
+
+
+@tool(description="""Write a personality file (SOUL.md, USER.md, or IDENTITY.md) to the .leonardo/ workspace.
+These files define the agent's identity, personality, and knowledge about the user.
+Use this when updating personality/user info over time as you learn about the user.
+- filename: Must be one of: SOUL.md, USER.md, IDENTITY.md
+- content: The markdown content to write""")
+def write_personality_file(
+    filename: str,
+    content: str,
+    runtime: ToolRuntime,
+) -> Command:
+    """Write a personality file to .leonardo/."""
+    tool_call_id = runtime.tool_call_id
+
+    if filename not in VALID_PERSONALITY_FILES:
+        return Command(
+            update={
+                "messages": [ToolMessage(
+                    f"Error: filename must be one of: {', '.join(VALID_PERSONALITY_FILES.keys())}",
+                    tool_call_id=tool_call_id
+                )]
+            }
+        )
+
+    filepath = Path(VALID_PERSONALITY_FILES[filename])
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(content, encoding="utf-8")
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Successfully wrote {filename} ({len(content)} chars).", tool_call_id=tool_call_id)]
+            }
+        )
+    except Exception as e:
+        return Command(
+            update={
+                "messages": [ToolMessage(f"Error writing {filename}: {e}", tool_call_id=tool_call_id)]
+            }
+        )
+
+
+
 
 @tool(description="""Read the langgraph.json configuration file.
 Returns the contents of /app/app/langgraph.json which registers all agents (built-in and custom).

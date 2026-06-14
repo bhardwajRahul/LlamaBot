@@ -1,9 +1,11 @@
+import asyncio
 from asyncio import Lock, CancelledError
 
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
 from app.websocket.web_socket_request_context import WebSocketRequestContext
+from app.lib.token_usage import extract_token_usage
 from typing import Dict, Optional
 
 from langchain_core.messages import HumanMessage
@@ -34,6 +36,7 @@ MODEL_CAPABILITIES = {
     # Gemini models support video, images, PDFs
     'gemini-3-flash': {'images': True, 'video': True, 'pdf': True},
     'gemini-3-pro': {'images': True, 'video': True, 'pdf': True},
+    'gemini-3.1-flash-lite': {'images': True, 'video': True, 'pdf': True},
     'gemini-2.5-flash': {'images': True, 'video': True, 'pdf': True},
     'gemini-2.5-pro': {'images': True, 'video': True, 'pdf': True},
 
@@ -49,8 +52,7 @@ MODEL_CAPABILITIES = {
     'gpt-5-codex': {'images': True, 'video': False, 'pdf': False},
 
     # DeepSeek - primarily text focused
-    'deepseek-chat': {'images': False, 'video': False, 'pdf': False},
-    'deepseek-reasoner': {'images': False, 'video': False, 'pdf': False},
+    'deepseek-v4-flash': {'images': False, 'video': False, 'pdf': False},
 }
 
 def get_model_capabilities(model_name: str) -> dict:
@@ -83,6 +85,177 @@ class RequestHandler:
         """Check if the WebSocket connection is still open"""
         return websocket.client_state == WebSocketState.CONNECTED
 
+    async def _repair_thread_state_if_needed(self, app, config):
+        """
+        Detect and repair two shapes of corrupted thread state that violate
+        the LLM contract `every tool message must follow an assistant message
+        with matching tool_calls`:
+
+        (A) Orphan ToolMessage — a ToolMessage with no preceding AIMessage
+            whose tool_calls include its tool_call_id. Cause: prior repair
+            or summarization dropped the anchoring AIMessage but left the
+            ToolMessage. Fix: RemoveMessage the orphan.
+
+        (B) Dangling tool_calls — an AIMessage with tool_calls that have no
+            corresponding following ToolMessage. Cause: task cancelled
+            mid-tool-execution. Fix: remove anything after the corrupted
+            AIMessage and inject synthetic "[Cancelled]" ToolMessages.
+
+        Both fixes are applied in a single aupdate_state call.
+        """
+        from langchain_core.messages import AIMessage, ToolMessage as LCToolMessage
+        from langchain_core.messages import RemoveMessage
+
+        try:
+            state_snapshot = await app.aget_state(config)
+            if not state_snapshot or not state_snapshot.values:
+                return
+
+            messages = state_snapshot.values.get("messages", [])
+            if not messages:
+                return
+
+            # Pass 1 (shape A): find orphan ToolMessages. Walk left-to-right
+            # tracking the "open" set of tool_call_ids from the most recent
+            # AIMessage. A ToolMessage whose tool_call_id is not in that set
+            # has no anchor.
+            orphan_msgs = []
+            open_ids: set = set()
+            for msg in messages:
+                if isinstance(msg, AIMessage):
+                    open_ids = {tc["id"] for tc in (getattr(msg, "tool_calls", []) or [])}
+                elif isinstance(msg, LCToolMessage):
+                    tcid = getattr(msg, "tool_call_id", None)
+                    if tcid in open_ids:
+                        open_ids.discard(tcid)
+                    else:
+                        orphan_msgs.append(msg)
+
+            # Pass 2 (shape B): find first AIMessage with dangling tool_calls.
+            corrupted_index = None
+            for i, msg in enumerate(messages):
+                if not isinstance(msg, AIMessage):
+                    continue
+                tool_calls = getattr(msg, "tool_calls", [])
+                if not tool_calls:
+                    continue
+                expected_ids = {tc["id"] for tc in tool_calls}
+                found_ids = set()
+                for j in range(i + 1, len(messages)):
+                    if isinstance(messages[j], LCToolMessage):
+                        found_ids.add(getattr(messages[j], "tool_call_id", None))
+                    elif isinstance(messages[j], AIMessage):
+                        break
+                if not expected_ids.issubset(found_ids):
+                    corrupted_index = i
+                    break
+
+            if not orphan_msgs and corrupted_index is None:
+                return
+
+            remove_ops = []
+            repair_messages = []
+
+            # Shape A: RemoveMessage each orphan ToolMessage. Orphans removed
+            # here will not be in the messages_to_remove slice below because
+            # the dangling-tool_calls fix only looks after `corrupted_index`.
+            if orphan_msgs:
+                logger.warning(
+                    f"Corrupted thread state detected: {len(orphan_msgs)} orphan ToolMessage(s) "
+                    f"with no anchoring AIMessage. Repairing..."
+                )
+                for m in orphan_msgs:
+                    mid = getattr(m, "id", None)
+                    if mid:
+                        remove_ops.append(RemoveMessage(id=mid))
+
+            # Shape B: drop everything after the corrupted AIMessage and inject
+            # synthetic ToolMessages for its dangling tool_calls.
+            if corrupted_index is not None:
+                corrupted_msg = messages[corrupted_index]
+                tool_calls = corrupted_msg.tool_calls
+                logger.warning(
+                    f"Corrupted thread state detected at message index {corrupted_index}: "
+                    f"AIMessage with {len(tool_calls)} dangling tool_call(s). Repairing..."
+                )
+                for m in messages[corrupted_index + 1:]:
+                    if hasattr(m, "id") and m.id:
+                        remove_ops.append(RemoveMessage(id=m.id))
+                for tc in tool_calls:
+                    repair_messages.append(LCToolMessage(
+                        content="[Cancelled] Tool execution was interrupted before completion.",
+                        tool_call_id=tc["id"],
+                        name=tc.get("name", "unknown"),
+                    ))
+
+            update_messages = remove_ops + repair_messages
+            await app.aupdate_state(config, {"messages": update_messages})
+            logger.info(
+                f"Thread state repaired: removed {len(remove_ops)} message(s) "
+                f"({len(orphan_msgs)} orphan(s) + others), "
+                f"injected {len(repair_messages)} synthetic ToolMessage(s)"
+            )
+
+        except Exception as e:
+            logger.warning(f"Thread state repair check failed (non-fatal): {e}")
+
+    async def _check_paywall_or_block(self, websocket: WebSocket) -> bool:
+        """
+        Per-instance paywall gate. Returns True if the message should be blocked
+        (a paywall_hit was sent to the websocket); False if it should proceed.
+
+        Fast path: cached state says allowed (or cache empty) -> return False, no network.
+        Slow path: cached state says blocked -> recheck mothership (the "user just paid"
+        recovery path). Fail-open on any mothership error.
+        """
+        paywall_enabled = os.getenv("PAYWALL_ENABLED", "false").lower() == "true"
+        logger.info(f"paywall gate: PAYWALL_ENABLED={paywall_enabled}")
+        if not paywall_enabled:
+            return False
+
+        credits = getattr(self.app.state, "paywall_credits", {}) or {}
+        logger.info(f"paywall gate: cache state={credits}")
+
+        # Cold start (no cache yet) or cached allowed -> fast path, allow.
+        if credits.get("allowed_next") is not False:
+            logger.info("paywall gate: cache allows (or empty), fast path -> ALLOW")
+            return False
+
+        # Cached blocked -> recheck mothership.
+        mothership = getattr(self.app.state, "mothership_client", None)
+        if mothership is None:
+            logger.info("paywall gate: no mothership client -> ALLOW (fail-open)")
+            return False
+
+        logger.info("paywall gate: cache blocked, calling check_paywall...")
+        recheck = await mothership.check_paywall()
+        logger.info(f"paywall gate: recheck returned {recheck}")
+        if recheck is None:
+            logger.info("paywall gate: recheck failed -> ALLOW (fail-open)")
+            return False
+
+        if recheck.get("allowed"):
+            self.app.state.paywall_credits = {
+                "allowed_next": True,
+                "messages_remaining": recheck.get("messages_remaining"),
+            }
+            logger.info(f"paywall gate: recheck says allowed -> ALLOW, cache updated to {self.app.state.paywall_credits}")
+            return False
+
+        # Still blocked — refresh cache and notify frontend.
+        messages_remaining = recheck.get("messages_remaining", 0)
+        self.app.state.paywall_credits = {
+            "allowed_next": False,
+            "messages_remaining": messages_remaining,
+        }
+        logger.info(f"paywall gate: recheck confirms BLOCKED, sending paywall_hit (messages_remaining={messages_remaining})")
+        if self._is_websocket_open(websocket):
+            await websocket.send_json({
+                "type": "paywall_hit",
+                "messages_remaining": messages_remaining,
+            })
+        return True
+
     # This is a the main function that handles incoming WebSocket requests. This will build the LangGraph workflow, and invoke it from a checkpointed state.
     async def handle_request(self, incoming_message: dict, websocket: WebSocket):
         """Handle incoming WebSocket requests with proper locking and cancellation"""
@@ -90,6 +263,29 @@ class RequestHandler:
         lock = self._get_lock(websocket)
 
         self.app.state.timestamp = datetime.now(timezone.utc) # keep timestamp updated
+
+        # Paywall gate — must run before report_message so blocked messages
+        # don't get counted against the user's quota.
+        if await self._check_paywall_or_block(websocket):
+            return
+
+        mothership = getattr(self.app.state, "mothership_client", None)
+        if mothership is not None:
+            async def _report_user_and_cache_paywall():
+                result = await mothership.report_message(
+                    thread_id=str(incoming_message.get("thread_id", "")),
+                    role="user",
+                    content=str(incoming_message.get("message", "")),
+                    sent_at=datetime.now(timezone.utc).isoformat(),
+                )
+                # Only role="user" responses carry paywall fields.
+                if result and "allowed_next" in result:
+                    self.app.state.paywall_credits = {
+                        "allowed_next": result.get("allowed_next"),
+                        "messages_remaining": result.get("messages_remaining"),
+                    }
+                    logger.info(f"paywall cache updated: {self.app.state.paywall_credits}")
+            asyncio.create_task(_report_user_and_cache_paywall())
 
         async with lock:
             try:
@@ -114,7 +310,28 @@ class RequestHandler:
                     "recursion_limit": recursion_limit
                 }
 
+                # Auto-repair corrupted thread state (dangling tool_calls without ToolMessages)
+                # This can happen when a previous task was cancelled mid-tool-execution
+                await self._repair_thread_state_if_needed(app, config)
+
                 async for chunk in app.astream(state, config=config, stream_mode=["updates", "messages"], subgraphs=True):
+
+                    # If the WS died mid-stream (e.g., uvicorn keepalive ping
+                    # timeout), stop here. Continuing would let the graph keep
+                    # advancing through tool nodes and writing checkpoints with
+                    # no observer, producing orphan ToolMessages that corrupt
+                    # the thread.
+                    if not self._is_websocket_open(websocket):
+                        logger.warning(
+                            f"WS closed mid-stream for thread {incoming_message.get('thread_id')}; "
+                            f"aborting astream consumer."
+                        )
+                        if mothership is not None:
+                            asyncio.create_task(mothership.report_disconnect(
+                                thread_id=str(incoming_message.get("thread_id", "")),
+                                reason="ws_closed_mid_stream",
+                            ))
+                        break
 
                     # NOTE: In LangGraph 0.5, they introduced this "subgraphs" parameter, that changes the datashape if you set it to True.
                     # if subgraph=True, it returns a tuple with 3 elements, instead of 2 elements.
@@ -122,8 +339,15 @@ class RequestHandler:
 
                     is_this_chunk_an_llm_message = isinstance(chunk, tuple) and len(chunk) == 3 and chunk[1] == 'messages'
                     is_this_chunk_an_update_stream_type = isinstance(chunk, tuple) and len(chunk) == 3 and chunk[1] == 'updates'
-                    logger.info(f"🍅🍅🍅 Chunk: {chunk}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"🍅🍅🍅 Chunk: {chunk}")
                     
+                    # Extract agent depth from subgraph tuple
+                    # chunk[0] is a tuple like () for main agent or ('tools:xxx',) for sub-agent
+                    subgraph_tuple = chunk[0] if isinstance(chunk, tuple) and len(chunk) >= 1 else ()
+                    agent_depth = len(subgraph_tuple)  # 0 = main agent, 1 = sub-agent, 2 = nested sub-agent
+                    is_subagent = agent_depth > 0
+
                     if is_this_chunk_an_llm_message:
                         message_chunk_from_llm = chunk[2][0] #AIMessageChunk object -> https://python.langchain.com/api_reference/core/messages/langchain_core.messages.ai.AIMessageChunk.html
                         data_type = "AIMessageChunk"
@@ -136,7 +360,9 @@ class RequestHandler:
                         # - Thinking/Reasoning blocks: [{type: "thinking"/"reasoning", text/thinking: "..."}]
                         # - DeepSeek: reasoning_content in additional_kwargs (separate from content)
                         content = base_message_as_dict["content"]
-                        logger.info(f"🍅 Content type: {type(content)}, Content: {content}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            True
+                            # logger.debug(f"🍅 Content type: {type(content)}, Content: {content}")
 
                         # Separate thinking/reasoning content from regular text content
                         # This allows the frontend to display thinking in a dedicated area
@@ -149,7 +375,7 @@ class RequestHandler:
                         deepseek_reasoning = additional_kwargs.get("reasoning_content")
                         if deepseek_reasoning:
                             thinking_content = [{"type": "thinking", "thinking": deepseek_reasoning}]
-                            logger.info(f"🧠 DeepSeek reasoning_content: {deepseek_reasoning[:100]}...")
+                            # logger.info(f"🧠 DeepSeek reasoning_content: {deepseek_reasoning[:100]}...")
 
                         if isinstance(content, list):
                             # Extract thinking/reasoning blocks (varies by provider)
@@ -192,7 +418,9 @@ class RequestHandler:
                                 "content": text_content,  # Text content only (thinking separated)
                                 "thinking": thinking_content,  # Thinking/reasoning content (may be None)
                                 "tool_calls": [],
-                                "base_message": base_message_as_dict
+                                "base_message": base_message_as_dict,
+                                "agent_depth": agent_depth,  # 0 = main agent, 1+ = sub-agent depth
+                                "is_subagent": is_subagent,  # True if this is from a delegated sub-agent
                             }
                             if token_usage:
                                 ws_message["token_usage"] = token_usage
@@ -200,7 +428,7 @@ class RequestHandler:
 
                     elif is_this_chunk_an_update_stream_type: # This means that LangGraph has given us a state update. This will often include a new message from the AI.
                         state_object = chunk[2]
-                        logger.info(f"🧠🧠🧠 LangGraph Output (State Update): {state_object}")
+                        # logger.info(f"🧠🧠🧠 LangGraph Output (State Update): {state_object}")
 
                         # Handle dynamic agent key - look for messages in any nested dict
                         messages = None
@@ -231,8 +459,8 @@ class RequestHandler:
                                                 tool_call_object = tool_calls[0]
                                                 tool_call_name = tool_call_object.get("name")
                                                 tool_call_args = tool_call_object.get("args")
-                                                logger.info(f"🔨🔨🔨 Tool Call Name: {tool_call_name}")
-                                                logger.info(f"🔨🔨🔨 Tool Call Args: {tool_call_args}")
+                                                # logger.info(f"🔨🔨🔨 Tool Call Name: {tool_call_name}")
+                                                # logger.info(f"🔨🔨🔨 Tool Call Args: {tool_call_args}")
 
                                     # AIMessage is not serializable to JSON, so we need to convert it to a string.
                                     messages_as_string = [msg.content if hasattr(msg, 'content') else str(msg) for msg in messages]
@@ -244,18 +472,12 @@ class RequestHandler:
                                         logger.warning(f"Failed to serialize message: {e}")
                                         base_message_as_dict = {"content": str(message), "type": "ai"}
 
-                                    # Extract token usage metadata if available (for context window tracking)
-                                    # Anthropic sends usage_metadata on the final AIMessage (not during streaming)
-                                    token_usage = None
-                                    usage_metadata = getattr(message, 'usage_metadata', None)
-
-                                    if usage_metadata:
-                                        token_usage = {
-                                            "input_tokens": usage_metadata.get("input_tokens", 0) if isinstance(usage_metadata, dict) else getattr(usage_metadata, 'input_tokens', 0),
-                                            "output_tokens": usage_metadata.get("output_tokens", 0) if isinstance(usage_metadata, dict) else getattr(usage_metadata, 'output_tokens', 0),
-                                            "total_tokens": usage_metadata.get("total_tokens", 0) if isinstance(usage_metadata, dict) else getattr(usage_metadata, 'total_tokens', 0)
-                                        }
-                                        logger.info(f"📊 Token usage: {token_usage}")
+                                    # Extract token usage metadata if available (for context window tracking).
+                                    # Includes prompt-cache fields (cache_read/cache_creation) so the
+                                    # mothership can measure cache-hit rate. Anthropic sends usage_metadata
+                                    # on the final AIMessage (not during streaming).
+                                    token_usage = extract_token_usage(message)
+                                    # logger.info(f"📊 Token usage: {token_usage}")
 
                                     # Only send if WebSocket is still open
                                     if self._is_websocket_open(websocket):
@@ -266,44 +488,65 @@ class RequestHandler:
                                             "type": message.type if hasattr(message, 'type') else "ai",
                                             "content": messages_as_string[-1] if messages_as_string else "",
                                             "tool_calls": tool_calls,
-                                            "base_message": base_message_as_dict
+                                            "base_message": base_message_as_dict,
+                                            "agent_depth": agent_depth,  # 0 = main agent, 1+ = sub-agent depth
+                                            "is_subagent": is_subagent,  # True if this is from a delegated sub-agent
                                         }
                                         if token_usage:
                                             llamapress_user_interface_json["token_usage"] = token_usage
 
                                         await websocket.send_json(llamapress_user_interface_json)
-                        logger.info(f"LangGraph Output (State Update): {chunk}")
+
+                                        if not is_subagent and llamapress_user_interface_json.get("type") == "ai":
+                                            mothership = getattr(self.app.state, "mothership_client", None)
+                                            if mothership is not None:
+                                                model_name = (base_message_as_dict.get("response_metadata") or {}).get("model_name")
+                                                asyncio.create_task(mothership.report_message(
+                                                    thread_id=str(incoming_message.get("thread_id", "")),
+                                                    role="assistant",
+                                                    content=str(llamapress_user_interface_json.get("content", "")),
+                                                    sent_at=datetime.now(timezone.utc).isoformat(),
+                                                    model=model_name,
+                                                    token_usage=token_usage,
+                                                ))
+                        
+                        # logger.info(f"LangGraph Output (State Update): {chunk}")
 
                         # chunk will look like this:
                         # {'llamabot': {'messages': [AIMessage(content='Hello! I hear you loud and clear. I'm LlamaBot, your full-stack Rails developer assistant. How can I help you today?', additional_kwargs={}, response_metadata={'finish_reason': 'stop', 'model_name': 'o4-mini-2025-04-16', 'service_tier': 'default'}, id='run--ce385bc4-fecb-4127-81d2-1da5814874f8')]}}
 
                     else:
-                        logger.info(f"Workflow output: {chunk}")
+                        True
+                        # logger.info(f"Workflow output: {chunk}")
 
                 print("🎏🎏🎏 LangGraph astream is finished!")
 
-                # Update thread metadata after successful message processing
-                await self._update_thread_metadata(incoming_message)
+                # Check if graph was interrupted (HITL approval, plan mode question, or mode switch)
+                interrupted = await self._check_and_send_interrupts(app, config, incoming_message, websocket)
 
-                # Clean up intermediate checkpoints for THIS thread only after successful run
-                # This bounds storage while preserving "continue" functionality for other threads
-                if hasattr(self.app.state, 'checkpointer_pool') and self.app.state.checkpointer_pool is not None:
-                    try:
-                        from app.services.checkpoint_cleanup import cleanup_thread_checkpoints_except_latest
-                        thread_id = incoming_message.get('thread_id')
-                        if thread_id:
-                            await cleanup_thread_checkpoints_except_latest(
-                                self.app.state.checkpointer_pool,
-                                thread_id
-                            )
-                    except Exception as e:
-                        # Non-fatal - don't fail the request if cleanup fails
-                        logger.warning(f"Post-run checkpoint cleanup failed (non-fatal): {e}")
+                if not interrupted:
+                    # Update thread metadata after successful message processing
+                    await self._update_thread_metadata(incoming_message)
 
-                if self._is_websocket_open(websocket):
-                    await websocket.send_json({
-                        "type": "end"
-                    })
+                    # Clean up intermediate checkpoints for THIS thread only after successful run
+                    # This bounds storage while preserving "continue" functionality for other threads
+                    if hasattr(self.app.state, 'checkpointer_pool') and self.app.state.checkpointer_pool is not None:
+                        try:
+                            from app.services.checkpoint_cleanup import cleanup_thread_checkpoints_except_latest
+                            thread_id = incoming_message.get('thread_id')
+                            if thread_id:
+                                await cleanup_thread_checkpoints_except_latest(
+                                    self.app.state.checkpointer_pool,
+                                    thread_id
+                                )
+                        except Exception as e:
+                            # Non-fatal - don't fail the request if cleanup fails
+                            logger.warning(f"Post-run checkpoint cleanup failed (non-fatal): {e}")
+
+                    if self._is_websocket_open(websocket):
+                        await websocket.send_json({
+                            "type": "end"
+                        })
 
             except CancelledError as e:
                 logger.info("handle_request was cancelled")
@@ -321,6 +564,327 @@ class RequestHandler:
                     await websocket.send_json({
                         "type": "error",
                         "content": f"Error processing request: {str(e)}"
+                    })
+                raise e
+
+    async def handle_approval_response(self, response_message: dict, websocket: WebSocket):
+        """Resume a graph after user approves/rejects a HITL request."""
+        from langgraph.types import Command
+
+        ws_id = id(websocket)
+        lock = self._get_lock(websocket)
+
+        async with lock:
+            try:
+                # Re-resolve the graph (same agent, with HITL)
+                app, _, agent_config = self.get_langgraph_app_and_state({
+                    "agent_name": response_message.get("agent_name"),
+                    "message": "",  # No new message, just resuming
+                    "ask_before_edits": True,
+                })
+
+                DEFAULT_RECURSION_LIMIT = 450
+                recursion_limit = agent_config.get("recursion_limit", DEFAULT_RECURSION_LIMIT)
+
+                config = {
+                    "configurable": {
+                        "thread_id": f"{response_message.get('thread_id')}",
+                        "recursion_limit": recursion_limit
+                    },
+                    "recursion_limit": recursion_limit
+                }
+
+                # Auto-repair corrupted thread state (defensive - less likely in HITL flow)
+                await self._repair_thread_state_if_needed(app, config)
+
+                # Build HITLResponse from user decisions
+                decisions = response_message.get("decisions", [])
+                hitl_response = {"decisions": decisions}
+
+                # Resume the graph
+                async for chunk in app.astream(Command(resume=hitl_response), config=config, stream_mode=["updates", "messages"], subgraphs=True):
+                    is_this_chunk_an_llm_message = isinstance(chunk, tuple) and len(chunk) == 3 and chunk[1] == 'messages'
+                    is_this_chunk_an_update_stream_type = isinstance(chunk, tuple) and len(chunk) == 3 and chunk[1] == 'updates'
+
+                    subgraph_tuple = chunk[0] if isinstance(chunk, tuple) and len(chunk) >= 1 else ()
+                    agent_depth = len(subgraph_tuple)
+                    is_subagent = agent_depth > 0
+
+                    if is_this_chunk_an_llm_message:
+                        message_chunk_from_llm = chunk[2][0]
+                        base_message_as_dict = dumpd(chunk[2][0])["kwargs"]
+                        content = base_message_as_dict["content"]
+
+                        thinking_content = None
+                        text_content = content
+
+                        additional_kwargs = base_message_as_dict.get("additional_kwargs", {})
+                        deepseek_reasoning = additional_kwargs.get("reasoning_content")
+                        if deepseek_reasoning:
+                            thinking_content = [{"type": "thinking", "thinking": deepseek_reasoning}]
+
+                        if isinstance(content, list):
+                            thinking_blocks = [b for b in content if b.get("type") in ("thinking", "reasoning", "reasoning_summary")]
+                            text_blocks = [b for b in content if b.get("type") not in ("thinking", "reasoning", "reasoning_summary")]
+                            if thinking_blocks:
+                                thinking_content = thinking_blocks
+                            text_content = text_blocks if text_blocks else ""
+
+                        if self._is_websocket_open(websocket):
+                            ws_message = {
+                                "type": "AIMessageChunk",
+                                "content": text_content,
+                                "thinking": thinking_content,
+                                "tool_calls": [],
+                                "base_message": base_message_as_dict,
+                                "agent_depth": agent_depth,
+                                "is_subagent": is_subagent,
+                            }
+                            await websocket.send_json(ws_message)
+
+                    elif is_this_chunk_an_update_stream_type:
+                        state_object = chunk[2]
+                        for agent_key, agent_data in state_object.items():
+                            if isinstance(agent_data, dict) and 'messages' in agent_data:
+                                messages = agent_data['messages']
+                                tool_calls = []
+                                if messages and len(messages) > 0:
+                                    message = messages[-1]
+                                    if hasattr(message, 'additional_kwargs') and message.additional_kwargs:
+                                        tool_calls_data = message.additional_kwargs.get('tool_calls')
+                                        if tool_calls_data:
+                                            tool_calls = tool_calls_data
+
+                                    messages_as_string = [msg.content if hasattr(msg, 'content') else str(msg) for msg in messages]
+                                    try:
+                                        base_message_as_dict = dumpd(message)["kwargs"]
+                                    except Exception:
+                                        base_message_as_dict = {"content": str(message), "type": "ai"}
+
+                                    token_usage = extract_token_usage(message)
+
+                                    if self._is_websocket_open(websocket):
+                                        ws_msg = {
+                                            "type": message.type if hasattr(message, 'type') else "ai",
+                                            "content": messages_as_string[-1] if messages_as_string else "",
+                                            "tool_calls": tool_calls,
+                                            "base_message": base_message_as_dict,
+                                            "agent_depth": agent_depth,
+                                            "is_subagent": is_subagent,
+                                        }
+                                        if token_usage:
+                                            ws_msg["token_usage"] = token_usage
+                                        await websocket.send_json(ws_msg)
+
+                # Check for another interrupt (agent may call another destructive tool or ask another question)
+                interrupted = await self._check_and_send_interrupts(app, config, response_message, websocket)
+
+                if not interrupted and self._is_websocket_open(websocket):
+                    await websocket.send_json({"type": "end"})
+
+            except CancelledError as e:
+                logger.info("handle_approval_response was cancelled")
+                raise e
+            except Exception as e:
+                logger.error(f"Error handling approval response: {str(e)}", exc_info=True)
+                if self._is_websocket_open(websocket):
+                    await websocket.send_json({
+                        "type": "error",
+                        "content": f"Error resuming after approval: {str(e)}"
+                    })
+                raise e
+
+    async def _check_and_send_interrupts(self, app, config, message_data, websocket) -> bool:
+        """Check for pending interrupts and send appropriate WebSocket messages.
+
+        Returns True if an interrupt was found and sent to the frontend.
+        Handles question interrupts, mode switch suggestions, and HITL approval requests.
+        """
+        try:
+            state_snapshot = await app.aget_state(config)
+            if not state_snapshot.tasks or not any(t.interrupts for t in state_snapshot.tasks):
+                return False
+
+            for task in state_snapshot.tasks:
+                for intr in task.interrupts:
+                    interrupt_value = intr.value
+                    if not self._is_websocket_open(websocket):
+                        continue
+
+                    # Plan mode question interrupt
+                    if isinstance(interrupt_value, dict) and interrupt_value.get("type") == "user_question":
+                        await websocket.send_json({
+                            "type": "question_request",
+                            "question": interrupt_value.get("question", ""),
+                            "options": interrupt_value.get("options", []),
+                            "context": interrupt_value.get("context", ""),
+                            "thread_id": message_data.get('thread_id'),
+                            "agent_name": message_data.get('agent_name'),
+                        })
+                        logger.info("Graph interrupted for plan mode question")
+
+                    # Suggest plan mode interrupt
+                    elif isinstance(interrupt_value, dict) and interrupt_value.get("type") == "suggest_mode_switch":
+                        await websocket.send_json({
+                            "type": "suggest_mode_switch",
+                            "target_mode": interrupt_value.get("target_mode", "plan"),
+                            "reason": interrupt_value.get("reason", ""),
+                            "thread_id": message_data.get('thread_id'),
+                            "agent_name": message_data.get('agent_name'),
+                        })
+                        logger.info("Graph interrupted for mode switch suggestion")
+
+                    # Implement ticket interrupt - offer to switch to engineer mode
+                    elif isinstance(interrupt_value, dict) and interrupt_value.get("type") == "implement_ticket":
+                        await websocket.send_json({
+                            "type": "implement_ticket",
+                            "ticket_id": interrupt_value.get("ticket_id"),
+                            "ticket_title": interrupt_value.get("ticket_title", ""),
+                            "ticket_content": interrupt_value.get("ticket_content", ""),
+                            "thread_id": message_data.get('thread_id'),
+                            "agent_name": message_data.get('agent_name'),
+                        })
+                        logger.info("Graph interrupted for implement ticket offer")
+
+                    # HITL approval interrupt
+                    elif isinstance(interrupt_value, dict) and "action_requests" in interrupt_value:
+                        await websocket.send_json({
+                            "type": "approval_request",
+                            "action_requests": [
+                                {"name": ar["name"], "args": ar["args"], "description": ar.get("description", "")}
+                                for ar in interrupt_value["action_requests"]
+                            ],
+                            "thread_id": message_data.get('thread_id'),
+                            "agent_name": message_data.get('agent_name'),
+                        })
+                        logger.info("Graph interrupted for HITL approval")
+
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to check for interrupts: {e}")
+            return False
+
+    async def handle_question_response(self, response_message: dict, websocket: WebSocket):
+        """Resume a graph after user answers a plan mode question."""
+        from langgraph.types import Command
+
+        ws_id = id(websocket)
+        lock = self._get_lock(websocket)
+
+        async with lock:
+            try:
+                # Re-resolve the graph (same agent, no HITL flag needed)
+                app, _, agent_config = self.get_langgraph_app_and_state({
+                    "agent_name": response_message.get("agent_name"),
+                    "message": "",  # No new message, just resuming
+                })
+
+                DEFAULT_RECURSION_LIMIT = 450
+                recursion_limit = agent_config.get("recursion_limit", DEFAULT_RECURSION_LIMIT)
+
+                config = {
+                    "configurable": {
+                        "thread_id": f"{response_message.get('thread_id')}",
+                        "recursion_limit": recursion_limit
+                    },
+                    "recursion_limit": recursion_limit
+                }
+
+                # Auto-repair corrupted thread state
+                await self._repair_thread_state_if_needed(app, config)
+
+                # Resume the graph — interrupt() returns this answer string
+                answer = response_message.get("answer", "")
+
+                async for chunk in app.astream(Command(resume=answer), config=config, stream_mode=["updates", "messages"], subgraphs=True):
+                    is_this_chunk_an_llm_message = isinstance(chunk, tuple) and len(chunk) == 3 and chunk[1] == 'messages'
+                    is_this_chunk_an_update_stream_type = isinstance(chunk, tuple) and len(chunk) == 3 and chunk[1] == 'updates'
+
+                    subgraph_tuple = chunk[0] if isinstance(chunk, tuple) and len(chunk) >= 1 else ()
+                    agent_depth = len(subgraph_tuple)
+                    is_subagent = agent_depth > 0
+
+                    if is_this_chunk_an_llm_message:
+                        message_chunk_from_llm = chunk[2][0]
+                        base_message_as_dict = dumpd(chunk[2][0])["kwargs"]
+                        content = base_message_as_dict["content"]
+
+                        thinking_content = None
+                        text_content = content
+
+                        additional_kwargs = base_message_as_dict.get("additional_kwargs", {})
+                        deepseek_reasoning = additional_kwargs.get("reasoning_content")
+                        if deepseek_reasoning:
+                            thinking_content = [{"type": "thinking", "thinking": deepseek_reasoning}]
+
+                        if isinstance(content, list):
+                            thinking_blocks = [b for b in content if b.get("type") in ("thinking", "reasoning", "reasoning_summary")]
+                            text_blocks = [b for b in content if b.get("type") not in ("thinking", "reasoning", "reasoning_summary")]
+                            if thinking_blocks:
+                                thinking_content = thinking_blocks
+                            text_content = text_blocks if text_blocks else ""
+
+                        if self._is_websocket_open(websocket):
+                            ws_message = {
+                                "type": "AIMessageChunk",
+                                "content": text_content,
+                                "thinking": thinking_content,
+                                "tool_calls": [],
+                                "base_message": base_message_as_dict,
+                                "agent_depth": agent_depth,
+                                "is_subagent": is_subagent,
+                            }
+                            await websocket.send_json(ws_message)
+
+                    elif is_this_chunk_an_update_stream_type:
+                        state_object = chunk[2]
+                        for agent_key, agent_data in state_object.items():
+                            if isinstance(agent_data, dict) and 'messages' in agent_data:
+                                messages = agent_data['messages']
+                                tool_calls = []
+                                if messages and len(messages) > 0:
+                                    message = messages[-1]
+                                    if hasattr(message, 'additional_kwargs') and message.additional_kwargs:
+                                        tool_calls_data = message.additional_kwargs.get('tool_calls')
+                                        if tool_calls_data:
+                                            tool_calls = tool_calls_data
+
+                                    messages_as_string = [msg.content if hasattr(msg, 'content') else str(msg) for msg in messages]
+                                    try:
+                                        base_message_as_dict = dumpd(message)["kwargs"]
+                                    except Exception:
+                                        base_message_as_dict = {"content": str(message), "type": "ai"}
+
+                                    token_usage = extract_token_usage(message)
+
+                                    if self._is_websocket_open(websocket):
+                                        ws_msg = {
+                                            "type": message.type if hasattr(message, 'type') else "ai",
+                                            "content": messages_as_string[-1] if messages_as_string else "",
+                                            "tool_calls": tool_calls,
+                                            "base_message": base_message_as_dict,
+                                            "agent_depth": agent_depth,
+                                            "is_subagent": is_subagent,
+                                        }
+                                        if token_usage:
+                                            ws_msg["token_usage"] = token_usage
+                                        await websocket.send_json(ws_msg)
+
+                # Check for another interrupt (agent may ask another question)
+                interrupted = await self._check_and_send_interrupts(app, config, response_message, websocket)
+
+                if not interrupted and self._is_websocket_open(websocket):
+                    await websocket.send_json({"type": "end"})
+
+            except CancelledError as e:
+                logger.info("handle_question_response was cancelled")
+                raise e
+            except Exception as e:
+                logger.error(f"Error handling question response: {str(e)}", exc_info=True)
+                if self._is_websocket_open(websocket):
+                    await websocket.send_json({
+                        "type": "error",
+                        "content": f"Error resuming after question: {str(e)}"
                     })
                 raise e
 
@@ -618,7 +1182,8 @@ class RequestHandler:
         if message.get("agent_name") is not None:
             langgraph_workflow, agent_config = self.get_workflow_from_langgraph_json(message)
             if langgraph_workflow is not None:
-                app = self.get_app_from_workflow_string(langgraph_workflow)
+                ask_before_edits = message.get("ask_before_edits", False)
+                app = self.get_app_from_workflow_string(langgraph_workflow, ask_before_edits=ask_before_edits)
 
                 # Create messages from the message content (with optional multimodal attachments)
                 # We removed this timestamp because we don't want to mess with prompt caching. If this date is different every time, it could cause a cache miss for the LLM provider.
@@ -652,7 +1217,7 @@ class RequestHandler:
     
     # This method resolves an agent name to a workflow with the checkpointer.
     # Super important for routing to the right agent workflow for websockets requests.
-    def get_app_from_workflow_string(self, workflow_string: str):
+    def get_app_from_workflow_string(self, workflow_string: str, ask_before_edits: bool = False):
         """Get pre-compiled graph from cache (singleton pattern for memory efficiency)"""
 
         # Extract agent name from workflow_string
@@ -662,24 +1227,42 @@ class RequestHandler:
         # Find the agent name (typically second-to-last component)
         agent_name = parts[-2] if len(parts) >= 2 else None
 
+        # Use separate cache key for HITL variant
+        cache_key = f"{agent_name}:hitl" if ask_before_edits else agent_name
+
         # Try to get from cache first (compiled at startup)
-        if agent_name and hasattr(self.app.state, 'compiled_graphs') and agent_name in self.app.state.compiled_graphs:
-            logger.info(f"✅ Using cached compiled graph for agent: {agent_name}")
-            return self.app.state.compiled_graphs[agent_name]
+        if cache_key and hasattr(self.app.state, 'compiled_graphs') and cache_key in self.app.state.compiled_graphs:
+            logger.info(f"✅ Using cached compiled graph for agent: {cache_key}")
+            return self.app.state.compiled_graphs[cache_key]
 
         # Fallback: compile on-demand (for backward compatibility or new agents)
-        logger.warning(f"⚠️ Compiling graph on-demand for: {agent_name} (not found in cache). Consider adding to startup compilation.")
+        logger.warning(f"⚠️ Compiling graph on-demand for: {cache_key} (not found in cache). Consider adding to startup compilation.")
 
         # Split the path into module path and function name
         module_path, function_name = workflow_string.split(':')
         # Remove './' if present and convert path to module format
         if module_path.startswith('./'):
             module_path = module_path[2:]
-        module_path = module_path.replace('/', '.').replace('.py', '')
+        # Strip the .py extension as a suffix only — using replace('.py', '') would
+        # also clobber it inside path segments like 'pyxl_agent' (-> 'xl_agent').
+        if module_path.endswith('.py'):
+            module_path = module_path[:-3]
+        module_path = module_path.replace('/', '.')
 
         # Dynamically import the module and get the function
         module = importlib.import_module(module_path)
         workflow_builder = getattr(module, function_name)
 
-        # Build the workflow using the imported function
-        return workflow_builder(checkpointer=self.get_or_create_checkpointer())
+        # Build the workflow, passing ask_before_edits if the builder supports it
+        import inspect
+        sig = inspect.signature(workflow_builder)
+        if 'ask_before_edits' in sig.parameters:
+            compiled = workflow_builder(checkpointer=self.get_or_create_checkpointer(), ask_before_edits=ask_before_edits)
+        else:
+            compiled = workflow_builder(checkpointer=self.get_or_create_checkpointer())
+
+        # Cache the HITL variant for reuse
+        if cache_key and hasattr(self.app.state, 'compiled_graphs'):
+            self.app.state.compiled_graphs[cache_key] = compiled
+
+        return compiled

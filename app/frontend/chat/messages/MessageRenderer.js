@@ -16,6 +16,9 @@ export class MessageRenderer {
     this.container = container;
     this.elements = elements;
     this.faviconBadgeManager = faviconBadgeManager;
+
+    // Set up event delegation for code block copy buttons
+    this.setupCodeBlockCopyHandler();
   }
 
   /**
@@ -49,6 +52,18 @@ export class MessageRenderer {
 
     if (type === 'end') {
       return this.handleEndMessage();
+    }
+
+    if (type === 'approval_request') {
+      return this.renderApprovalMessage(content);
+    }
+
+    if (type === 'question_request' || type === 'suggest_mode_switch' || type === 'implement_ticket') {
+      return this.renderInterruptMessage(content);
+    }
+
+    if (type === 'system_message') {
+      return this.renderSystemMessage(content);
     }
 
     return null;
@@ -166,13 +181,22 @@ export class MessageRenderer {
       const toolCall = baseMessage.tool_calls[0];
       let firstArgument = toolCall.args[Object.keys(toolCall.args)[0]] || '';
 
+      // Extract agent depth for sub-agent badge display
+      const agentDepth = baseMessage.agent_depth || 0;
+
       messageDiv.innerHTML = this.toolRenderer.createCollapsibleToolMessage(
         toolCall.name,
         firstArgument,
         JSON.stringify(toolCall.args),
-        ''
+        '',
+        agentDepth
       );
       messageDiv.id = baseMessage.tool_calls[0].id;
+
+      // Add agent depth data attribute to the message div for CSS styling
+      if (agentDepth > 0) {
+        messageDiv.setAttribute('data-agent-depth', agentDepth);
+      }
     } else {
       // Apply custom CSS classes if configured (only for regular AI messages, not tool messages)
       if (this.config.cssClasses?.aiMessage) {
@@ -209,6 +233,35 @@ export class MessageRenderer {
       });
     };
     messageDiv.appendChild(copyBtn);
+  }
+
+  /**
+   * Set up event delegation for code block copy buttons
+   */
+  setupCodeBlockCopyHandler() {
+    this.messageHistory.addEventListener('click', (e) => {
+      const copyBtn = e.target.closest('[data-llamabot="code-copy-btn"]');
+      if (!copyBtn) return;
+
+      e.stopPropagation();
+
+      // Find the code element within the same container
+      const container = copyBtn.closest('.code-block-container');
+      const codeElement = container?.querySelector('pre code');
+
+      if (codeElement) {
+        const codeText = codeElement.textContent;
+        navigator.clipboard.writeText(codeText).then(() => {
+          // Visual feedback
+          copyBtn.innerHTML = '<i class="fa-solid fa-check"></i>';
+          copyBtn.classList.add('copied');
+          setTimeout(() => {
+            copyBtn.innerHTML = '<i class="fa-regular fa-copy"></i>';
+            copyBtn.classList.remove('copied');
+          }, 1500);
+        });
+      }
+    });
   }
 
   /**
@@ -385,6 +438,80 @@ export class MessageRenderer {
   }
 
   /**
+   * Render approval request card (HTML content from MessageHandler)
+   */
+  renderApprovalMessage(htmlContent) {
+    const messageDiv = document.createElement('div');
+    messageDiv.setAttribute('data-llamabot', 'approval-message');
+    messageDiv.innerHTML = htmlContent;
+    this.insertMessage(messageDiv);
+    this.stopThinking();
+    return messageDiv;
+  }
+
+  /**
+   * Render interrupt-based message (question card or mode switch card)
+   */
+  renderInterruptMessage(htmlContent) {
+    const messageDiv = document.createElement('div');
+    messageDiv.setAttribute('data-llamabot', 'interrupt-message');
+    messageDiv.innerHTML = htmlContent;
+    this.insertMessage(messageDiv);
+    this.stopThinking();
+    return messageDiv;
+  }
+
+  /**
+   * Render system message (e.g. cancellation notice)
+   */
+  renderSystemMessage(content) {
+    const messageDiv = document.createElement('div');
+    messageDiv.setAttribute('data-llamabot', 'system-message');
+    messageDiv.textContent = content;
+    this.insertMessage(messageDiv);
+    return messageDiv;
+  }
+
+  /**
+   * Render paywall card with upgrade CTA
+   */
+  renderPaywallMessage(upgradeUrl) {
+    const messageDiv = document.createElement('div');
+    messageDiv.setAttribute('data-llamabot', 'paywall-message');
+    messageDiv.innerHTML = `
+      <div class="paywall-card-icon">
+        <i class="fa-solid fa-crown"></i>
+      </div>
+      <div class="paywall-card-body">
+        <div class="paywall-card-title">You've used your free messages for today</div>
+        <div class="paywall-card-subtitle">Come back tomorrow or upgrade for more messages</div>
+        <a href="${upgradeUrl}" target="_blank" rel="noopener noreferrer" class="paywall-card-cta">
+          <i class="fa-solid fa-bolt"></i>
+          <span>Upgrade to keep building</span>
+        </a>
+      </div>
+    `;
+
+    const cta = messageDiv.querySelector('.paywall-card-cta');
+    if (cta) {
+      cta.addEventListener('click', () => {
+        if (window.posthog) {
+          window.posthog.capture('paywall_upgrade_clicked', { upgrade_url: upgradeUrl });
+        }
+      });
+    }
+
+    this.insertMessage(messageDiv);
+    this.stopThinking();
+
+    if (window.posthog) {
+      window.posthog.capture('paywall_hit');
+    }
+
+    return messageDiv;
+  }
+
+  /**
    * Handle end of stream
    */
   handleEndMessage() {
@@ -410,7 +537,79 @@ export class MessageRenderer {
     // Emit custom event for other components to handle
     window.dispatchEvent(new CustomEvent('streamEnded'));
 
+    // Trigger auto-backup if enabled
+    this.triggerAutoBackup();
+
     return null;
+  }
+
+  /**
+   * Trigger non-blocking auto-backup on task completion
+   */
+  triggerAutoBackup() {
+    // Check if auto-backup is enabled (default: on)
+    if (localStorage.getItem('autoBackupEnabled') === 'false') return;
+
+    const statusEl = document.querySelector('[data-llamabot="backup-status"]');
+    if (!statusEl) return;
+
+    statusEl.textContent = 'saving...';
+    statusEl.className = 'backup-status backup-status--active';
+
+    fetch('/api/auto-backup', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'skipped') {
+          statusEl.textContent = 'not saved';
+          statusEl.className = 'backup-status backup-status--error';
+          setTimeout(() => {
+            statusEl.textContent = '';
+            statusEl.className = 'backup-status';
+          }, 5000);
+          return;
+        }
+        if (data.status === 'started' && data.backup_id) {
+          this.pollBackupStatus(data.backup_id, statusEl);
+        }
+      })
+      .catch(() => {
+        statusEl.textContent = '';
+        statusEl.className = 'backup-status';
+      });
+  }
+
+  /**
+   * Poll backup status until complete
+   */
+  pollBackupStatus(backupId, statusEl) {
+    const poll = () => {
+      fetch(`/api/auto-backup/${backupId}/status`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.status === 'running') {
+            setTimeout(poll, 5000);
+          } else if (data.status === 'completed') {
+            statusEl.textContent = 'saved!';
+            statusEl.className = 'backup-status backup-status--done';
+            setTimeout(() => {
+              statusEl.textContent = '';
+              statusEl.className = 'backup-status';
+            }, 3000);
+          } else {
+            statusEl.textContent = 'backup failed';
+            statusEl.className = 'backup-status backup-status--error';
+            setTimeout(() => {
+              statusEl.textContent = '';
+              statusEl.className = 'backup-status';
+            }, 5000);
+          }
+        })
+        .catch(() => {
+          statusEl.textContent = '';
+          statusEl.className = 'backup-status';
+        });
+    };
+    setTimeout(poll, 5000);
   }
 
   /**
@@ -488,7 +687,7 @@ export class MessageRenderer {
       if (thinkingMessage) {
         this.messageHistory.insertBefore(aiMessageDiv, thinkingMessage);
       } else {
-        const scrollButton = document.getElementById('scrollToBottomBtn');
+        const scrollButton = document.querySelector('[data-llamabot="scroll-to-bottom"]');
         if (scrollButton && lastToolMessage.nextSibling === scrollButton) {
           // Insert before scroll button
           this.messageHistory.insertBefore(aiMessageDiv, scrollButton);
@@ -514,7 +713,7 @@ export class MessageRenderer {
    * Clear all messages
    */
   clearMessages() {
-    const scrollButton = document.getElementById('scrollToBottomBtn');
+    const scrollButton = document.querySelector('[data-llamabot="scroll-to-bottom"]');
     this.messageHistory.innerHTML = '';
 
     if (scrollButton) {

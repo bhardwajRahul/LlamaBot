@@ -369,10 +369,10 @@ export class ThreadManager {
       // Show default message
       const defaultMessage = document.createElement('div');
       defaultMessage.className = 'message ai-message';
-      defaultMessage.textContent = "Hi! I'm Leonardo. What are we building today?";
+      defaultMessage.textContent = "Hi! What are we building today?";
 
       const messageHistory = this.messageRenderer.getMessageHistory();
-      const scrollButton = document.getElementById('scrollToBottomBtn');
+      const scrollButton = document.querySelector('[data-llamabot="scroll-to-bottom"]');
 
       if (scrollButton) {
         messageHistory.insertBefore(defaultMessage, scrollButton);
@@ -456,10 +456,10 @@ export class ThreadManager {
     // Show default welcome message
     const defaultMessage = document.createElement('div');
     defaultMessage.className = 'message ai-message';
-    defaultMessage.textContent = "Hi! I'm Leonardo. What are we building today?";
+    defaultMessage.textContent = "Hi! What are we building today?";
 
     const messageHistory = this.messageRenderer.getMessageHistory();
-    const scrollButton = document.getElementById('scrollToBottomBtn');
+    const scrollButton = document.querySelector('[data-llamabot="scroll-to-bottom"]');
 
     if (scrollButton) {
       messageHistory.insertBefore(defaultMessage, scrollButton);

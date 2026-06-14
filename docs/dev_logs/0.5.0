@@ -1,0 +1,36 @@
+0.5.0:
+- [x] Improve styling & add PyXL mode.
+- [x] Add PyXL capabilities for very deep analysis of a spreadsheet.
+- [x] Add in planning mode for beginners, along with the AskQuestion tool call
+- [x] Remove old agent modes that aren't being used
+- [x] Add tool to self-fix the permission issues in the Rails container
+- [x] Improve PyXL to write to markdown and allow for the user to ask questions/engage/add more contex
+
+0.5.0a:
+- [x] Add Gemini 3.1 Flash Lite for Affordable Image Analysis
+- [x] Add in an update checker against mothership, so the user can pull down llamabot & llamapress updates without needing to use the terminal
+- [x] Add in a new route for transferring images from the mothership to here.
+
+0.5.0b: 
+- [x] Add in the ability to go back to a user's LlamaPress dashboard, "https://llamapress/user_instances"
+
+0.5.0c:
+- [x] add fix_permissions tool to additional agent modes
+
+0.5.0d: 
+- [x] improve prompts based on the fix_permissions role
+
+0.5.0e:
+- [x] Add proactive building after ticket mode to speed up dev
+ 
+0.5.1:
+- [x] **Milestone: first image cut through the new candidate QA system** — a real-VM QA gate now sits in front of main (see Leonardo docs/QA_STAGING.md and RELEASE_FLOW.md). This release rolls up the previously-unshipped 0.5.0e–f changes.
+- [x] Allow .docx upload to assets; the file path is handed to the agent (via the existing uploaded-files message), which reads it from the Rails environment — no document parsing in the LLM transport layer.
+- [x] Add a Download button to every file in Browse Uploads (serves Content-Disposition: attachment; the OS opens it in the real app).
+- [x] Accept slideshows (PowerPoint .pptx/.ppt/.pptm, Keynote .key, OpenDocument .odp) and all Excel types incl. macros (.xlsm/.xlsb/.xltx/.xltm) for upload.
+- [x] Preview inline only for browser-native types (images, PDF); Office/slideshow files download instead of half-rendering — no LibreOffice/hosted-viewer dependency.
+- [x] Security: stop serving SVG inline (it can embed script — XSS vector); SVG now downloads.
+- [x] CI: run on PRs targeting *-alpha dev branches — PRs into 0.4.1-alpha were merging with no CI.
+
+future:
+- [] Add an inbox for users & Leos to send messages to LlamaPress Support team, and for the LP support team to respond to them.

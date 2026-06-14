@@ -6,7 +6,7 @@ import re
 import os
 
 from typing import Optional
-from fastapi import APIRouter, Request, Depends, HTTPException, Query
+from fastapi import APIRouter, Request, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -47,6 +47,21 @@ class CreatePromptRequest(BaseModel):
 
 
 class UpdatePromptRequest(BaseModel):
+    name: str | None = None
+    content: str | None = None
+    group: str | None = None
+    description: str | None = None
+    is_active: bool | None = None
+
+
+class CreateSkillRequest(BaseModel):
+    name: str
+    content: str
+    group: str = "General"
+    description: str | None = None
+
+
+class UpdateSkillRequest(BaseModel):
     name: str | None = None
     content: str | None = None
     group: str | None = None
@@ -102,6 +117,27 @@ def get_container_version() -> str:
     except Exception as e:
         logger.debug(f"Could not get container version: {e}")
         return "dev"
+
+
+def get_llamapress_version() -> str:
+    """Get the LlamaPress version from docker-compose.yml."""
+    compose_paths = [
+        "/app/leonardo/docker-compose.yml",
+        "/app/leonardo/docker-compose-dev.yml",
+    ]
+    for compose_path in compose_paths:
+        try:
+            with open(compose_path, 'r') as f:
+                for line in f:
+                    if 'image:' in line and 'llamapress-simple:' in line:
+                        match = re.search(r'llamapress-simple:([^\s"\']+)', line)
+                        if match:
+                            return match.group(1)
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logger.debug(f"Could not parse {compose_path} for llamapress version: {e}")
+    return "dev"
 
 
 @router.get("/api/version", response_class=JSONResponse)
@@ -189,6 +225,53 @@ async def api_get_version_notes():
     version = get_container_version()
     notes = get_version_notes(version)
     return {"version": version, "notes": notes}
+
+
+@router.get("/api/check-updates", response_class=JSONResponse)
+async def api_check_updates():
+    """Check mothership for available updates to llamabot and llamapress."""
+    from app.services.mothership_client import MothershipClient
+    mothership = MothershipClient()
+    if not mothership.enabled:
+        return {"updates_available": False, "reason": "mothership_not_configured"}
+
+    llamabot_version = get_container_version()
+    llamapress_version = get_llamapress_version()
+
+    result = await mothership.check_updates(llamabot_version, llamapress_version)
+    if result is None:
+        return {"updates_available": False, "reason": "check_failed"}
+    return result
+
+
+class UpdateRequest(BaseModel):
+    llamabot_version: str
+    llamapress_version: str
+
+
+@router.post("/api/update", response_class=JSONResponse)
+async def api_perform_update(
+    request: UpdateRequest,
+    current_user: User = Depends(engineer_or_admin_required),
+):
+    """Update docker-compose.yml image tags, pull new images, and restart."""
+    version_pattern = re.compile(r'^[0-9a-zA-Z.\-]+$')
+    if not version_pattern.match(request.llamabot_version) or not version_pattern.match(request.llamapress_version):
+        raise HTTPException(status_code=400, detail="Invalid version format")
+
+    from app.routers.slash_commands import execute_command
+    command = f"bash bin/update {request.llamabot_version} {request.llamapress_version}"
+    try:
+        result = execute_command(command, timeout=300)
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout.strip() if result.stdout else "",
+            "stderr": result.stderr.strip() if result.stderr else "",
+            "return_code": result.returncode,
+        }
+    except Exception as e:
+        # Container may be killed mid-response during restart
+        return {"success": True, "stdout": "Update initiated, server restarting...", "stderr": "", "return_code": 0}
 
 
 # ============== WebSocket Authentication API ==============
@@ -415,8 +498,9 @@ async def available_models():
         "gpt-5-codex": "OPENAI_API_KEY",
         "gemini-3-flash": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "gemini-3-pro": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-        "deepseek-chat": "DEEPSEEK_API_KEY",
-        "deepseek-reasoner": "DEEPSEEK_API_KEY",
+        "gemini-3.1-flash-lite": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        "deepseek-v4-flash": "DEEPSEEK_API_KEY",
+        "deepseek-v4-pro": "DEEPSEEK_API_KEY",
     }
 
     models = []
@@ -778,10 +862,10 @@ async def update_leonardo_md(
 # ============== Visible Agents Configuration ==============
 
 # Default visible agents for users without a custom configuration
-DEFAULT_VISIBLE_AGENTS = ["ticket", "engineer", "testing", "feedback", "user"]
+DEFAULT_VISIBLE_AGENTS = ["ticket", "engineer", "testing", "feedback", "user", "beginner"]
 
 # All valid agent mode keys (must match config.js agentModes)
-VALID_AGENT_MODES = ["ticket", "engineer", "feedback", "prototype", "ai_builder", "testing", "architect", "user"]
+VALID_AGENT_MODES = ["ticket", "engineer", "feedback", "ai_builder", "testing", "user", "beginner"]
 
 
 class UpdateVisibleAgentsRequest(BaseModel):
@@ -826,3 +910,556 @@ async def set_visible_agents(
 
     logger.info(f"User '{current_user.username}' updated visible_agents to {request.visible_agents}")
     return {"visible_agents": request.visible_agents, "message": "Visible agents updated"}
+
+
+# ============== Site Settings API ==============
+
+VALID_SITE_SETTINGS = {"show_token_wheel", "proactive_build_after_ticket"}
+
+
+def get_site_setting(session: Session, key: str, default: str = "false") -> str:
+    """Get a site setting value, returning default if not found.
+
+    Falls back to the default when the auth database is unavailable
+    (e.g. LEONARDO_DB_URI is not set), matching db.py's degradation.
+    """
+    from app.models import SiteSetting
+    try:
+        setting = session.get(SiteSetting, key)
+    except Exception as e:
+        logger.warning(f"Could not read site setting '{key}', using default '{default}': {e}")
+        return default
+    return setting.value if setting else default
+
+
+@router.get("/api/site-settings/{key}", response_class=JSONResponse)
+async def api_get_site_setting(
+    key: str,
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session),
+):
+    """Get a site setting value."""
+    if key not in VALID_SITE_SETTINGS:
+        raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
+    value = get_site_setting(session, key)
+    return {"key": key, "value": value}
+
+
+@router.put("/api/site-settings/{key}", response_class=JSONResponse)
+async def api_set_site_setting(
+    key: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+):
+    """Set a site setting value (engineer or admin only)."""
+    if current_user.role not in ("engineer",) and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only engineers or admins can change site settings")
+    if key not in VALID_SITE_SETTINGS:
+        raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
+
+    from app.models import SiteSetting
+    from datetime import datetime, timezone
+
+    body = await request.json()
+    value = str(body.get("value", "false"))
+
+    setting = session.get(SiteSetting, key)
+    if setting:
+        setting.value = value
+        setting.updated_at = datetime.now(timezone.utc)
+    else:
+        setting = SiteSetting(key=key, value=value)
+        session.add(setting)
+    session.commit()
+
+    logger.info(f"Site setting '{key}' set to '{value}' by {current_user.username}")
+    return {"key": key, "value": value}
+
+
+# ============== Skills Library API ==============
+
+@router.get("/api/skills", response_class=JSONResponse)
+async def api_get_skills(
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session),
+    group: Optional[str] = Query(None, description="Filter by group"),
+    search: Optional[str] = Query(None, description="Search term")
+):
+    """Get all skills, optionally filtered by group or search term."""
+    from app.services.skill_service import (
+        get_all_skills, get_skills_by_group, search_skills
+    )
+
+    if search:
+        skills = search_skills(session, search)
+    elif group:
+        skills = get_skills_by_group(session, group)
+    else:
+        skills = get_all_skills(session)
+
+    return [
+        {
+            "id": s.id,
+            "name": s.name,
+            "content": s.content,
+            "description": s.description,
+            "group": s.group,
+            "usage_count": s.usage_count,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        }
+        for s in skills
+    ]
+
+
+@router.get("/api/skills/groups", response_class=JSONResponse)
+async def api_get_skill_groups(
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session)
+):
+    """Get list of unique skill groups."""
+    from app.services.skill_service import get_skill_groups
+    groups = get_skill_groups(session)
+    return {"groups": groups}
+
+
+@router.get("/api/skills/{skill_id}", response_class=JSONResponse)
+async def api_get_skill(
+    skill_id: int,
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session)
+):
+    """Get a specific skill by ID."""
+    from app.services.skill_service import get_skill_by_id
+    skill = get_skill_by_id(session, skill_id)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    return {
+        "id": skill.id,
+        "name": skill.name,
+        "content": skill.content,
+        "description": skill.description,
+        "group": skill.group,
+        "usage_count": skill.usage_count,
+        "created_at": skill.created_at.isoformat() if skill.created_at else None,
+        "updated_at": skill.updated_at.isoformat() if skill.updated_at else None,
+    }
+
+
+@router.post("/api/skills", response_class=JSONResponse)
+async def api_create_skill(
+    request: CreateSkillRequest,
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session)
+):
+    """Create a new skill."""
+    from app.services.skill_service import create_skill
+
+    if not request.name or not request.name.strip():
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not request.content or not request.content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+
+    skill = create_skill(
+        session,
+        name=request.name,
+        content=request.content,
+        group=request.group,
+        description=request.description
+    )
+
+    return {
+        "id": skill.id,
+        "name": skill.name,
+        "message": "Skill created successfully"
+    }
+
+
+@router.patch("/api/skills/{skill_id}", response_class=JSONResponse)
+async def api_update_skill(
+    skill_id: int,
+    request: UpdateSkillRequest,
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session)
+):
+    """Update an existing skill."""
+    from app.services.skill_service import update_skill
+
+    skill = update_skill(
+        session, skill_id,
+        name=request.name,
+        content=request.content,
+        group=request.group,
+        description=request.description,
+        is_active=request.is_active
+    )
+
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    return {"message": "Skill updated successfully"}
+
+
+@router.delete("/api/skills/{skill_id}", response_class=JSONResponse)
+async def api_delete_skill(
+    skill_id: int,
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session),
+    hard_delete: bool = Query(False, description="Permanently delete")
+):
+    """Delete a skill (soft delete by default)."""
+    from app.services.skill_service import delete_skill
+
+    if not delete_skill(session, skill_id, hard_delete=hard_delete):
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    return {"message": "Skill deleted successfully"}
+
+
+@router.post("/api/skills/{skill_id}/use", response_class=JSONResponse)
+async def api_use_skill(
+    skill_id: int,
+    username: str = Depends(auth),
+    session: Session = Depends(get_db_session)
+):
+    """Increment usage count when a skill is selected."""
+    from app.services.skill_service import increment_usage
+
+    skill = increment_usage(session, skill_id)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    return {"usage_count": skill.usage_count}
+
+
+# ============== File Upload to Assets ==============
+
+UPLOAD_ALLOWED_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg',
+    # Spreadsheets — all Excel variants, incl. macro-enabled and binary
+    '.xlsx', '.xls', '.xlsm', '.xlsb', '.xltx', '.xltm', '.csv',
+    # Documents
+    '.pdf', '.docx',
+    # Slideshows — PowerPoint (incl. macros), Keynote, OpenDocument
+    '.pptx', '.ppt', '.pptm', '.key', '.odp',
+    # Media
+    '.mp4', '.webm',
+}
+
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}
+
+# Types a browser can safely render inline. Deliberately excludes SVG: an SVG can
+# embed <script>, so serving it inline is an XSS vector — it downloads instead.
+# Everything not listed here (Office docs, slideshows, etc.) also downloads; we do
+# not render those server-side (no LibreOffice/conversion — keeps the image small
+# and the surface area tiny). The OS opens them in the real app.
+INLINE_PREVIEW_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf'}
+
+RAILS_ROOT = "/app/app/rails"
+IMAGES_DIR = f"{RAILS_ROOT}/app/assets/images"
+IMPORTS_DIR = f"{RAILS_ROOT}/app/imports"
+
+
+@router.post("/api/upload-to-assets", response_class=JSONResponse)
+async def upload_to_assets(
+    file: UploadFile = File(...),
+    username: str = Depends(auth),
+):
+    """Upload a file: images go to app/assets/images, everything else to app/imports."""
+    import pathlib
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+
+    # Validate extension
+    ext = pathlib.Path(file.filename).suffix.lower()
+    if ext not in UPLOAD_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{ext}' not allowed. Allowed: {', '.join(sorted(UPLOAD_ALLOWED_EXTENSIONS))}"
+        )
+
+    # Sanitize filename - keep only safe characters
+    safe_filename = re.sub(r'[^\w\-.]', '_', file.filename)
+
+    # Route images to assets/images, everything else to app/imports
+    if ext in IMAGE_EXTENSIONS:
+        dest_dir = IMAGES_DIR
+        relative_path = f"app/assets/images/{safe_filename}"
+    else:
+        dest_dir = IMPORTS_DIR
+        relative_path = f"app/imports/{safe_filename}"
+
+    # Ensure directory exists
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # Save file
+    dest_path = os.path.join(dest_dir, safe_filename)
+    contents = await file.read()
+    with open(dest_path, "wb") as f:
+        f.write(contents)
+
+    logger.info(f"File uploaded: {relative_path} by {username} ({len(contents)} bytes)")
+
+    return {
+        "filename": safe_filename,
+        "path": relative_path,
+        "size": len(contents),
+    }
+
+
+@router.get("/api/uploaded-files", response_class=JSONResponse)
+async def list_uploaded_files(username: str = Depends(auth)):
+    """List files in app/assets/images and app/imports."""
+    import pathlib
+
+    files = []
+    for dir_path, rel_prefix in [(IMAGES_DIR, "app/assets/images"), (IMPORTS_DIR, "app/imports")]:
+        d = pathlib.Path(dir_path)
+        if not d.exists():
+            continue
+        for f in sorted(d.iterdir()):
+            if f.is_file() and not f.name.startswith('.'):
+                files.append({
+                    "filename": f.name,
+                    "path": f"{rel_prefix}/{f.name}",
+                    "size": f.stat().st_size,
+                    "folder": rel_prefix,
+                })
+
+    return {"files": files}
+
+
+MAX_PREVIEW_BYTES = 50 * 1024 * 1024
+
+PREVIEW_PATH_PREFIXES = {
+    "app/assets/images": IMAGES_DIR,
+    "app/imports": IMPORTS_DIR,
+}
+
+
+@router.get("/api/uploaded-files/preview")
+async def preview_uploaded_file(path: str, download: bool = False, username: str = Depends(auth)):
+    """Serve an uploaded file.
+
+    download=1 always forces a download (Content-Disposition: attachment).
+    Otherwise we serve inline only for browser-native types (raster images, PDF);
+    everything else — Office docs, slideshows, SVG — downloads. Capped at 50MB.
+    """
+    import pathlib
+    from fastapi.responses import FileResponse
+
+    base_dir = None
+    filename = None
+    for prefix, candidate_base in PREVIEW_PATH_PREFIXES.items():
+        if path.startswith(prefix + "/"):
+            filename = path[len(prefix) + 1:]
+            base_dir = candidate_base
+            break
+    if base_dir is None or not filename:
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    real_full = os.path.realpath(os.path.join(base_dir, filename))
+    real_base = os.path.realpath(base_dir)
+    if not (real_full == real_base or real_full.startswith(real_base + os.sep)):
+        raise HTTPException(status_code=400, detail="Path traversal blocked")
+
+    if not os.path.isfile(real_full):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    size = os.path.getsize(real_full)
+    if size > MAX_PREVIEW_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large to preview ({size} bytes, max {MAX_PREVIEW_BYTES})")
+
+    ext = pathlib.Path(filename).suffix.lower()
+    inline = (not download) and ext in INLINE_PREVIEW_EXTENSIONS
+    disposition = "inline" if inline else "attachment"
+    return FileResponse(real_full, filename=filename, content_disposition_type=disposition)
+
+
+# ============== Remote Setup API ==============
+# Used by the mothership (Rails) to push context files after claiming an instance.
+# Auth: HTTP Basic Auth with the admin credentials set up by LlamabotAdminRegistrar.
+
+
+class WriteFileEntry(BaseModel):
+    path: str
+    content: str
+
+
+class WriteFilesRequest(BaseModel):
+    files: list[WriteFileEntry]
+
+
+# Map friendly mothership paths to actual filesystem paths.
+# Paths not in this map are written as-is (relative to CWD).
+WRITE_FILES_PATH_MAP = {
+    "Leonardo.md": ".leonardo/LEONARDO.md",
+    "User.md": ".leonardo/USER.md",
+}
+
+
+@router.post("/api/write_files", response_class=JSONResponse)
+async def api_write_files(
+    body: WriteFilesRequest,
+    current_user: User = Depends(admin_required),
+):
+    """Write files to disk. Used by the mothership to push context files after claiming an instance."""
+    results = []
+
+    for entry in body.files:
+        file_path = entry.path
+
+        # Resolve friendly names to actual paths
+        resolved = WRITE_FILES_PATH_MAP.get(file_path, file_path)
+        resolved = os.path.normpath(resolved)
+
+        # Prevent path traversal outside the working directory
+        if resolved.startswith("..") or os.path.isabs(resolved):
+            results.append({"path": file_path, "status": "error", "detail": "Absolute or traversal paths not allowed"})
+            continue
+
+        try:
+            parent = os.path.dirname(resolved)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(resolved, "w", encoding="utf-8") as f:
+                f.write(entry.content)
+            logger.info(f"write_files: wrote {resolved} ({len(entry.content)} chars) by {current_user.username}")
+            results.append({"path": file_path, "status": "ok"})
+        except Exception as e:
+            logger.error(f"write_files: failed to write {file_path}: {e}")
+            results.append({"path": file_path, "status": "error", "detail": str(e)})
+
+    return {"results": results}
+
+
+class ImportFromS3Request(BaseModel):
+    url: str
+    filename: str | None = None
+
+
+@router.post("/api/setup/import-excel", response_class=JSONResponse)
+async def api_import_excel_from_s3(
+    body: ImportFromS3Request,
+    current_user: User = Depends(admin_required),
+):
+    """Download a file from S3 (pre-signed URL) and save it to rails/app/imports/."""
+    import pathlib
+    import httpx
+
+    # Derive filename from the URL if not provided (strip query params)
+    if body.filename:
+        filename = body.filename
+    else:
+        url_path = body.url.split("?")[0]
+        filename = url_path.rsplit("/", 1)[-1]
+
+    if not filename:
+        raise HTTPException(status_code=400, detail="Could not determine filename from URL. Provide a 'filename' field.")
+
+    # Validate extension
+    ext = pathlib.Path(filename).suffix.lower()
+    if ext not in {".xlsx", ".xls", ".csv"}:
+        raise HTTPException(status_code=400, detail=f"File type '{ext}' not allowed. Allowed: .xlsx, .xls, .csv")
+
+    # Sanitize filename
+    safe_filename = re.sub(r'[^\w\-.]', '_', filename)
+
+    os.makedirs(IMPORTS_DIR, exist_ok=True)
+    dest_path = os.path.join(IMPORTS_DIR, safe_filename)
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(body.url)
+            resp.raise_for_status()
+
+        with open(dest_path, "wb") as f:
+            f.write(resp.content)
+
+        logger.info(f"import-excel: downloaded {safe_filename} ({len(resp.content)} bytes) by {current_user.username}")
+        return {
+            "filename": safe_filename,
+            "path": f"app/imports/{safe_filename}",
+            "size": len(resp.content),
+        }
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to download from S3: HTTP {e.response.status_code}")
+    except Exception as e:
+        logger.error(f"import-excel: failed to download {body.url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to download file: {e}")
+
+
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+MAX_IMAGE_SIZE = 25 * 1024 * 1024  # 25 MB
+
+
+@router.post("/api/setup/import-image", response_class=JSONResponse)
+async def api_import_image_from_s3(
+    body: ImportFromS3Request,
+    current_user: User = Depends(admin_required),
+):
+    """Download an image from S3 and save it to rails/app/imports/."""
+    import pathlib
+    import httpx
+    from urllib.parse import unquote
+
+    # Derive filename
+    if body.filename:
+        filename = body.filename
+    else:
+        url_path = body.url.split("?")[0]
+        filename = unquote(url_path.rsplit("/", 1)[-1])
+
+    if not filename:
+        raise HTTPException(status_code=400, detail="Could not determine filename from URL. Provide a 'filename' field.")
+
+    # Validate extension
+    ext = pathlib.Path(filename).suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"not an image: {ext}")
+
+    # Sanitize (strip path traversal, unsafe chars)
+    safe_filename = re.sub(r'[^\w\-.]', '_', os.path.basename(filename))
+
+    os.makedirs(IMPORTS_DIR, exist_ok=True)
+    dest_path = os.path.join(IMPORTS_DIR, safe_filename)
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(body.url)
+            resp.raise_for_status()
+
+        # Size check
+        if len(resp.content) > MAX_IMAGE_SIZE:
+            raise HTTPException(status_code=400, detail=f"Image too large: {len(resp.content)} bytes (max {MAX_IMAGE_SIZE})")
+
+        # Magic-byte validation
+        header = resp.content[:12]
+        is_valid_image = (
+            header[:8] == b'\x89PNG\r\n\x1a\n'
+            or header[:2] == b'\xff\xd8'
+            or header[:4] == b'GIF8'
+            or (header[:4] == b'RIFF' and header[8:12] == b'WEBP')
+        )
+        if not is_valid_image:
+            raise HTTPException(status_code=400, detail="File content does not match a supported image format")
+
+        with open(dest_path, "wb") as f:
+            f.write(resp.content)
+
+        logger.info(f"import-image: downloaded {safe_filename} ({len(resp.content)} bytes) by {current_user.username}")
+        return {"status": "ok", "saved_path": f"rails/app/imports/{safe_filename}"}
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to download from S3: HTTP {e.response.status_code}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"import-image: failed to download {body.url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to download file: {e}")

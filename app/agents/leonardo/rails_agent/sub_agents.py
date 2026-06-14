@@ -34,8 +34,8 @@ from app.agents.leonardo.rails_agent.tools import (
     grep_files, glob_files,
     git_command, github_cli_command, internet_search
 )
-# Import the model factory from middleware to use the same model as the main agent
-from app.agents.leonardo.rails_agent.middleware import DynamicModelMiddleware
+# Shared LLM factory - single source of truth for model selection
+from app.agents.leonardo.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +59,31 @@ The main agent will use your findings to decide what changes to make.
 - **RETURN findings** - The main agent uses your research to decide next steps
 
 ## RESEARCH TOOLS AVAILABLE
+- `read_file` - Read file contents (USE THIS, not `cat`)
+- `glob_files` - Find files by pattern (USE THIS, not `find`)
+- `grep_files` - Search file contents by regex (USE THIS, not `grep`)
 - `ls` - List directory contents
-- `read_file` - Read file contents
-- `glob_files` - Find files by pattern (e.g., "**/*.rb")
-- `grep_files` - Search file contents by regex
 - `bash_command` - Run read-only Rails commands (e.g., `rails runner "puts User.count"`)
 - `write_todos` - Track your research progress
+- `internet_search` - Search the web for Rails documentation, gem usage, or solutions
+
+## ⛔ FORBIDDEN BASH COMMANDS
+NEVER use these bash commands - use the dedicated tools instead:
+
+| ❌ NEVER USE | ✅ USE INSTEAD |
+|--------------|----------------|
+| `cat file.rb` | `read_file` tool |
+| `head -50 file.rb` | `read_file` with limit param |
+| `tail -20 file.rb` | `read_file` with offset param |
+| `grep "pattern" file` | `grep_files` tool |
+| `find . -name "*.rb"` | `glob_files` tool |
+
+**Exception:** Piping output through `head`/`tail` IS allowed to limit command output:
+```bash
+bundle exec rails runner "puts User.all" | tail -20   # ✅ OK
+```
+
+`bash_command` is ONLY for: Rails runner queries, rake tasks, and system queries.
 
 ## RESEARCH METHODOLOGY
 
@@ -82,6 +101,36 @@ The main agent will use your findings to decide what changes to make.
 1. **File Structure** - Where are the relevant files?
 2. **Associations** - How do models relate?
 3. **Routes** - What endpoints exist?
+
+## SPREADSHEET INSPECTION
+
+When asked to inspect an Excel/CSV file, use the Roo gem via Rails runner:
+
+```bash
+bundle exec rails runner "
+  require 'roo'
+  xlsx = Roo::Spreadsheet.open('/tmp/import.xlsx')
+  xlsx.sheets.each do |sheet_name|
+    puts '=== Sheet: ' + sheet_name + ' ==='
+    sheet = xlsx.sheet(sheet_name)
+    puts 'Rows: ' + sheet.last_row.to_s
+    puts 'Columns: ' + sheet.last_column.to_s
+    puts 'Header row: ' + sheet.row(1).inspect
+    puts 'Sample row 2: ' + sheet.row(2).inspect
+    puts 'Sample row 3: ' + sheet.row(3).inspect
+    # Check for formulas
+    (1..sheet.last_column).each do |col|
+      formula = sheet.formula(2, col)
+      if formula
+        puts 'Formula in column ' + col.to_s + ': ' + formula.to_s
+      end
+    end
+    puts ''
+  end
+"
+```
+
+Report back: number of sheets, column headers, row counts, data types, any formulas/calculated columns, and relationships between sheets.
 
 ## OUTPUT FORMAT
 
@@ -168,14 +217,13 @@ def create_sub_agent(llm_model: str = None):
         #search_file,
         grep_files, glob_files,
         bash_command,
-        git_status, git_commit, git_command, github_cli_command,
+        # git_status, git_commit, git_command, github_cli_command,  # Disabled to prevent auto-commits
         internet_search,
         # Note: delegate_task is NOT included to prevent infinite recursion
     ]
 
-    # Use the same model as the main agent by reusing DynamicModelMiddleware's _get_llm
-    model_middleware = DynamicModelMiddleware()
-    model = model_middleware._get_llm(llm_model or 'gemini-3-flash')
+    # Use the same model as the main agent via the shared llm_factory
+    model = get_llm(llm_model or 'deepseek-v4-flash')
 
     return create_agent(
         model=model,
@@ -294,15 +342,15 @@ def create_research_sub_agent(llm_model: str = None):
         glob_files,   # Find files by pattern
         grep_files,   # Search file contents
         bash_command, # For read-only Rails queries (e.g., rails runner)
+        internet_search,  # Search the web for documentation/solutions
         # NO write_file - cannot write files
         # NO edit_file - cannot edit files
         # NO git tools - cannot make commits
         # NO delegate_task/delegate_research - prevent recursion
     ]
 
-    # Use the same model as the main agent
-    model_middleware = DynamicModelMiddleware()
-    model = model_middleware._get_llm(llm_model or 'gemini-3-flash')
+    # Use the same model as the main agent via the shared llm_factory
+    model = get_llm(llm_model or 'deepseek-v4-flash')
 
     return create_agent(
         model=model,

@@ -24,14 +24,16 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain.tools import tool, ToolRuntime
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 from datetime import date
 import base64
 
 from app.agents.leonardo.rails_agent.state import RailsAgentState
 from app.agents.leonardo.rails_agent.tools import (
     write_todos, ls, read_file, write_file, edit_file, search_file, bash_command,
+    fix_permissions,
     rails_api_sh,
+    save_memory, list_memories, delete_memory,
 )
 from app.agents.leonardo.rails_ticket_mode_agent.prompts import TICKET_MODE_AGENT_PROMPT
 from app.agents.leonardo.project_context import build_system_prompt_with_project_context
@@ -243,14 +245,53 @@ puts "TICKET_CREATED:" + ticket.id.to_s
         )
 
 
+
+OFFER_IMPLEMENTATION_DESCRIPTION = """After successfully creating a ticket, offer to switch to engineer mode and implement it.
+
+Parameters:
+- ticket_id: The ID of the ticket just created
+- ticket_title: The ticket title
+- ticket_content: The full ticket content (description + research_notes + notes) for the engineer agent
+
+Shows the user Yes/No buttons. If Yes, the frontend switches to engineer mode, creates a new thread, and auto-sends the ticket content."""
+
+
+@tool(description=OFFER_IMPLEMENTATION_DESCRIPTION)
+def offer_implementation(
+    ticket_id: str,
+    ticket_title: str,
+    ticket_content: str,
+    runtime: ToolRuntime,
+) -> Command:
+    """Offer to switch to engineer mode and implement the ticket."""
+    tool_call_id = runtime.tool_call_id
+    user_decision = interrupt({
+        "type": "implement_ticket",
+        "ticket_id": ticket_id,
+        "ticket_title": ticket_title,
+        "ticket_content": ticket_content,
+    })
+    return Command(
+        update={
+            "messages": [ToolMessage(
+                content=f"User responded to implementation offer: {user_decision}",
+                tool_call_id=tool_call_id
+            )]
+        }
+    )
+
+
 # Tool list - tools available to the Ticket Mode agent (NO internet_search)
 default_tools = [
     write_todos,
     ls, read_file, write_file, edit_file, search_file,
     bash_command,
+    fix_permissions,     # Fix permission issues in Rails container
     delegate_task,       # Sub-agent delegation for focused research tasks
     delegate_research,   # Read-only sub-agent for codebase investigation
     write_final_ticket,  # Creates ticket directly in Rails database
+    offer_implementation,  # Offer to switch to engineer mode after ticket creation
+    save_memory, list_memories, delete_memory,
 ]
 
 

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Request, Depends, HTTPException, Form
@@ -12,15 +13,39 @@ from app.db import engine
 from app.models import User
 from app.dependencies import (
     security, get_db_session, auth, get_current_user, admin_required, has_any_users,
-    engineer_or_admin_required
+    engineer_or_admin_required, try_authenticate
 )
 from app.services.user_service import authenticate_user, get_user_by_username
+from app.services.token_service import (
+    SESSION_COOKIE_NAME,
+    SESSION_COOKIE_SECURE,
+    SESSION_TTL_DAYS,
+    create_session_token,
+)
+from app.services.magic_link_service import (
+    MagicLinkInvalid,
+    MagicLinkSecretMissing,
+    verify_magic_link_token,
+)
 
 # Role-based default visible agents
 DEFAULT_VISIBLE_AGENTS_USER = ["feedback"]
-DEFAULT_VISIBLE_AGENTS_ENGINEER = ["ticket", "engineer", "testing", "feedback", "user", "prototype", "ai_builder", "architect"]
+DEFAULT_VISIBLE_AGENTS_ENGINEER = ["ticket", "engineer", "testing", "feedback", "user", "ai_builder", "beginner", "pyxl"]
 
 logger = logging.getLogger(__name__)
+
+
+def _read_leonardo_value(filename: str) -> str | None:
+    path = f".leonardo/{filename}"
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+        return value or None
+    except Exception as e:
+        logger.warning(f"Could not read {path}: {e}")
+        return None
 
 router = APIRouter()
 
@@ -34,16 +59,15 @@ async def root(request: Request):
     if not has_any_users():
         return RedirectResponse(url="/register", status_code=302)
 
-    # Otherwise require authentication
-    credentials = await security(request)
+    # Otherwise require authentication (session cookie OR Basic Auth).
+    # Unauthenticated browser users are redirected to /login so they get the
+    # nice HTML form rather than the browser's native Basic Auth dialog.
+    # Basic Auth still works for curl / scripted callers — they pass an
+    # Authorization header and never see the redirect.
     with Session(engine) as session:
-        user = authenticate_user(session, credentials.username, credentials.password)
+        user = try_authenticate(request, session)
         if not user:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid credentials",
-                headers={"WWW-Authenticate": "Basic"},
-            )
+            return RedirectResponse(url="/login", status_code=302)
 
         # Get visible agents for this user (role-based defaults)
         visible_agents = None
@@ -63,10 +87,27 @@ async def root(request: Request):
         # Serve the chat.html file with user role and visible agents injected
         with open(frontend_dir / "chat.html") as f:
             html = f.read()
-        # Inject user role and visible agents as global variables for the frontend
+        # Read site settings
+        from app.routers.api import get_site_setting
+        show_token_wheel = get_site_setting(session, "show_token_wheel", "false") == "true"
+        proactive_build = get_site_setting(session, "proactive_build_after_ticket", "false") == "true"
+
+        # Inject user role, visible agents, and PostHog config as global variables for the frontend
+        posthog_key = os.getenv("LLAMABOT_POSTHOG_KEY", "")
+        posthog_host = os.getenv("LLAMABOT_POSTHOG_HOST", "")
+        enable_github_button = os.getenv("ENABLE_GITHUB_BUTTON", "").lower() == "true"
+        llamapress_user_id = _read_leonardo_value("LLAMAPRESS_USER_ID.txt")
+        llamapress_email = _read_leonardo_value("LLAMAPRESS_EMAIL.txt")
         config_script = f'''<script>
 window.LLAMABOT_USER_ROLE = "{getattr(user, "role", "engineer")}";
 window.LLAMABOT_VISIBLE_AGENTS = {json.dumps(visible_agents)};
+window.LLAMABOT_SHOW_TOKEN_WHEEL = {"true" if show_token_wheel else "false"};
+window.LLAMABOT_POSTHOG_KEY = {json.dumps(posthog_key) if posthog_key else "null"};
+window.LLAMABOT_POSTHOG_HOST = {json.dumps(posthog_host) if posthog_host else "null"};
+window.LLAMAPRESS_USER_ID = {json.dumps(llamapress_user_id) if llamapress_user_id else "null"};
+window.LLAMAPRESS_EMAIL = {json.dumps(llamapress_email) if llamapress_email else "null"};
+window.ENABLE_GITHUB_BUTTON = {"true" if enable_github_button else "false"};
+window.LLAMABOT_PROACTIVE_BUILD = {"true" if proactive_build else "false"};
 </script>'''
         html = html.replace('</head>', f'{config_script}</head>')
         return HTMLResponse(content=html)
@@ -138,6 +179,118 @@ async def register(
         )
 
 
+_SESSION_COOKIE_KWARGS = dict(
+    key=SESSION_COOKIE_NAME,
+    httponly=True,
+    secure=SESSION_COOKIE_SECURE,
+    samesite="lax",
+    path="/",
+    max_age=SESSION_TTL_DAYS * 24 * 3600,
+)
+
+
+def _set_session_cookie(response, user: User) -> None:
+    response.set_cookie(value=create_session_token(user), **_SESSION_COOKIE_KWARGS)
+
+
+@router.post("/login")
+async def login(
+    request: Request,
+    session: Session = Depends(get_db_session),
+):
+    """Exchange username/password for a session cookie.
+
+    Accepts either JSON `{"username": ..., "password": ...}` or
+    `application/x-www-form-urlencoded` so password managers and basic <form>
+    submissions both work.
+    """
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        username = body.get("username")
+        password = body.get("password")
+    else:
+        form = await request.form()
+        username = form.get("username")
+        password = form.get("password")
+
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise HTTPException(status_code=400, detail="username and password required")
+
+    user = authenticate_user(session, username, password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    response = JSONResponse({"ok": True, "username": user.username})
+    _set_session_cookie(response, user)
+    return response
+
+
+@router.get("/login")
+async def login_get(
+    request: Request,
+    token: str = "",
+    session: Session = Depends(get_db_session),
+):
+    """Login endpoint — dual purpose.
+
+    - `GET /login` (no token): serves the HTML sign-in form. Replaces the
+      browser's native Basic Auth dialog as the front door for browser users.
+    - `GET /login?token=<signed>`: magic-link sign-in. Used by the
+      LlamaPress.ai Rails mothership to redirect a user into a freshly-claimed
+      Leonardo instance with the user already signed in. Validates an
+      HMAC-signed token, looks up the user by username, sets the session
+      cookie, and redirects to /.
+
+    Unknown username → 401 (no auto-provision; /register remains the only
+    user-creation path). The Rails side guarantees the user exists before
+    generating the magic-link token.
+    """
+    if not token:
+        # No token → serve the sign-in form. If no users exist yet, push them
+        # to registration instead.
+        if not has_any_users():
+            return RedirectResponse(url="/register", status_code=302)
+        with open("login.html") as f:
+            return HTMLResponse(content=f.read())
+
+    try:
+        username = verify_magic_link_token(token)
+    except MagicLinkSecretMissing:
+        # Operator-facing: the instance launcher forgot to wire the secret through.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Magic-link sign-in is not configured on this instance "
+                "(LLAMAPRESS_AI_LOGIN_SECRET is unset). POST /login still works."
+            ),
+        )
+    except MagicLinkInvalid as e:
+        logger.info(f"Magic-link rejected: {e}")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user = get_user_by_username(session, username)
+    if not user or not user.is_active:
+        # Intentional: 401, not auto-provision. Rails owns the sequencing fix.
+        raise HTTPException(status_code=401, detail="Unknown user")
+
+    # Preserve ?prompt= and ?conversation= params through the redirect
+    from urllib.parse import urlencode
+    forward_params = {}
+    for key in ("prompt", "conversation", "welcome_prompt"):
+        val = request.query_params.get(key)
+        if val:
+            forward_params[key] = val
+    redirect_url = f"/?{urlencode(forward_params)}" if forward_params else "/"
+
+    response = RedirectResponse(url=redirect_url, status_code=302)
+    _set_session_cookie(response, user)
+    return response
+
+
 @router.get("/users", response_class=HTMLResponse)
 async def users_page(admin: User = Depends(admin_required)):
     """Serve the admin user management page."""
@@ -150,14 +303,14 @@ async def users_page(admin: User = Depends(admin_required)):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
         :root {
-            --bg-color: #1a1a1a;
-            --chat-bg: #2d2d2d;
+            --bg-color: #0d0d1a;
+            --chat-bg: #1a1730;
             --text-color: #e0e0e0;
-            --border-color: #404040;
-            --accent-color: #4CAF50;
+            --border-color: rgba(139, 92, 246, 0.2);
+            --accent-color: #8b5cf6;
         }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             margin: 0;
@@ -188,7 +341,7 @@ async def users_page(admin: User = Depends(admin_required)):
             text-decoration: none;
             transition: background 0.2s;
         }
-        .back-btn:hover { background: var(--border-color); }
+        .back-btn:hover { background: rgba(139, 92, 246, 0.15); }
         h1 { font-size: 1.5rem; margin: 0; }
         .card {
             background: var(--chat-bg);
@@ -199,14 +352,14 @@ async def users_page(admin: User = Depends(admin_required)):
         }
         .card-header {
             font-size: 0.85rem;
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
             text-transform: uppercase;
             letter-spacing: 0.5px;
             margin-bottom: 16px;
         }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border-color); }
-        th { color: #888; font-weight: 500; font-size: 0.85rem; }
+        th { color: rgba(255, 255, 255, 0.5); font-weight: 500; font-size: 0.85rem; }
         tr:last-child td { border-bottom: none; }
         .badge {
             padding: 4px 10px;
@@ -215,11 +368,11 @@ async def users_page(admin: User = Depends(admin_required)):
             font-weight: 500;
             text-transform: uppercase;
         }
-        .badge-engineer { background: rgba(33, 150, 243, 0.2); color: #64b5f6; }
-        .badge-user { background: rgba(156, 39, 176, 0.2); color: #ce93d8; }
-        .badge-admin { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-        .badge-active { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-        .badge-inactive { background: rgba(244, 67, 54, 0.2); color: #e57373; }
+        .badge-engineer { background: rgba(139, 92, 246, 0.2); color: #a78bfa; }
+        .badge-user { background: rgba(167, 139, 250, 0.15); color: #c4b5fd; }
+        .badge-admin { background: rgba(139, 92, 246, 0.2); color: #a78bfa; }
+        .badge-active { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+        .badge-inactive { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
         .btn {
             padding: 6px 12px;
             border: 1px solid var(--border-color);
@@ -231,12 +384,12 @@ async def users_page(admin: User = Depends(admin_required)):
             color: var(--text-color);
             transition: all 0.2s;
         }
-        .btn:hover { background: var(--border-color); }
-        .btn-danger { border-color: #e57373; color: #e57373; }
-        .btn-danger:hover { background: rgba(244, 67, 54, 0.2); }
+        .btn:hover { background: rgba(139, 92, 246, 0.15); }
+        .btn-danger { border-color: rgba(239, 68, 68, 0.25); color: #ef4444; }
+        .btn-danger:hover { background: rgba(239, 68, 68, 0.15); }
         .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
         .form-group { flex: 1; min-width: 120px; }
-        .form-group label { display: block; margin-bottom: 6px; font-size: 0.85rem; color: #888; }
+        .form-group label { display: block; margin-bottom: 6px; font-size: 0.85rem; color: rgba(255, 255, 255, 0.5); }
         .form-group input, .form-group select {
             width: 100%;
             padding: 10px;
@@ -248,23 +401,24 @@ async def users_page(admin: User = Depends(admin_required)):
         }
         .form-group input:focus, .form-group select:focus {
             outline: none;
-            border-color: var(--accent-color);
+            border-color: rgba(139, 92, 246, 0.4);
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.08);
         }
         .btn-primary {
-            background: var(--accent-color);
-            border-color: var(--accent-color);
+            background: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%);
+            border-color: #8b5cf6;
             color: white;
             padding: 10px 20px;
         }
-        .btn-primary:hover { opacity: 0.9; background: var(--accent-color); }
+        .btn-primary:hover { opacity: 0.9; }
         .message {
             padding: 12px 16px;
             border-radius: 8px;
             margin-bottom: 20px;
             display: none;
         }
-        .message.success { background: rgba(76, 175, 80, 0.2); color: #81c784; display: block; }
-        .message.error { background: rgba(244, 67, 54, 0.2); color: #e57373; display: block; }
+        .message.success { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.25); color: #22c55e; display: block; }
+        .message.error { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.25); color: #ef4444; display: block; }
         .actions { white-space: nowrap; }
         select.role-select {
             padding: 4px 8px;
@@ -462,7 +616,7 @@ async def users_page(admin: User = Depends(admin_required)):
 
 @router.get("/prompt-library", response_class=HTMLResponse)
 async def prompt_library_page(current_user: User = Depends(get_current_user)):
-    """Serve the prompt library management page."""
+    """Serve the prompt library management page with tabs for Prompts and Skills."""
     html = """
 <!DOCTYPE html>
 <html>
@@ -472,15 +626,17 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
         :root {
-            --bg-color: #1a1a1a;
-            --chat-bg: #2d2d2d;
+            --bg-color: #0d0d1a;
+            --chat-bg: #1a1730;
             --text-color: #e0e0e0;
-            --border-color: #404040;
+            --border-color: rgba(139, 92, 246, 0.2);
             --accent-color: #8b5cf6;
             --accent-hover: #7c3aed;
+            --skill-color: #3b82f6;
+            --skill-hover: #2563eb;
         }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             margin: 0;
@@ -496,7 +652,7 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             display: flex;
             align-items: center;
             gap: 15px;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
         }
         .back-btn {
             display: flex;
@@ -511,8 +667,39 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             text-decoration: none;
             transition: background 0.2s;
         }
-        .back-btn:hover { background: var(--border-color); }
+        .back-btn:hover { background: rgba(139, 92, 246, 0.15); }
         h1 { font-size: 1.5rem; margin: 0; flex: 1; }
+        /* Tab styles */
+        .tab-container {
+            display: flex;
+            gap: 0;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .tab-btn {
+            padding: 12px 24px;
+            background: transparent;
+            border: none;
+            border-bottom: 3px solid transparent;
+            color: rgba(255,255,255,0.6);
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .tab-btn:hover {
+            color: var(--text-color);
+            background: rgba(255,255,255,0.05);
+        }
+        .tab-btn.active {
+            color: var(--accent-color);
+            border-bottom-color: var(--accent-color);
+        }
+        .tab-btn.active.skill-tab {
+            color: var(--skill-color);
+            border-bottom-color: var(--skill-color);
+        }
+        .tab-btn i { margin-right: 8px; }
         .card {
             background: var(--chat-bg);
             border: 1px solid var(--border-color);
@@ -581,17 +768,17 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             color: var(--text-color);
             transition: all 0.2s;
         }
-        .btn:hover { background: var(--border-color); }
+        .btn:hover { background: rgba(139, 92, 246, 0.15); }
         .btn-primary {
-            background: var(--accent-color);
-            border-color: var(--accent-color);
+            background: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%);
+            border-color: #8b5cf6;
             color: white;
         }
-        .btn-primary:hover { background: var(--accent-hover); }
-        .btn-danger { border-color: #e57373; color: #e57373; }
-        .btn-danger:hover { background: rgba(244, 67, 54, 0.2); }
+        .btn-primary:hover { opacity: 0.9; }
+        .btn-danger { border-color: rgba(239, 68, 68, 0.25); color: #ef4444; }
+        .btn-danger:hover { background: rgba(239, 68, 68, 0.15); }
         .form-group { margin-bottom: 16px; }
-        .form-group label { display: block; margin-bottom: 6px; font-size: 0.85rem; color: #888; }
+        .form-group label { display: block; margin-bottom: 6px; font-size: 0.85rem; color: rgba(255, 255, 255, 0.5); }
         .form-group input, .form-group select, .form-group textarea {
             width: 100%;
             padding: 10px;
@@ -605,7 +792,8 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
         .form-group textarea { min-height: 150px; resize: vertical; }
         .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
             outline: none;
-            border-color: var(--accent-color);
+            border-color: rgba(139, 92, 246, 0.4);
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.08);
         }
         .modal {
             display: none;
@@ -614,7 +802,7 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             left: 0;
             right: 0;
             bottom: 0;
-            background: rgba(0,0,0,0.7);
+            background: rgba(0,0,0,0.8);
             z-index: 1000;
             justify-content: center;
             align-items: center;
@@ -682,42 +870,87 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             margin-bottom: 20px;
             display: none;
         }
-        .message.success { background: rgba(139, 92, 246, 0.2); color: #a78bfa; display: block; }
-        .message.error { background: rgba(244, 67, 54, 0.2); color: #e57373; display: block; }
+        .message.success { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.25); color: #22c55e; display: block; }
+        .message.error { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.25); color: #ef4444; display: block; }
+        /* Skill-specific styles */
+        .skill-card { border-left: 3px solid var(--skill-color); }
+        .skill-card:hover { border-color: var(--skill-hover); }
+        .skill-group-badge {
+            background: rgba(59, 130, 246, 0.2);
+            color: var(--skill-color);
+        }
+        .btn-skill {
+            background: var(--skill-color);
+            border-color: var(--skill-color);
+        }
+        .btn-skill:hover { background: var(--skill-hover); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <a href="/" class="back-btn"><i class="fa-solid fa-arrow-left"></i></a>
-            <h1>Prompt Library</h1>
-            <button class="btn btn-primary" onclick="showCreateModal()">
-                <i class="fa-solid fa-plus"></i> New Prompt
+            <h1>Prompt & Skill Library</h1>
+        </div>
+
+        <div class="tab-container">
+            <button class="tab-btn active" data-tab="prompts" onclick="switchTab('prompts')">
+                <i class="fa-solid fa-book"></i> Prompts
+            </button>
+            <button class="tab-btn skill-tab" data-tab="skills" onclick="switchTab('skills')">
+                <i class="fa-solid fa-bolt"></i> Skills
             </button>
         </div>
 
         <div id="message" class="message"></div>
 
-        <div class="filter-bar">
-            <input type="text" class="search-input" placeholder="Search prompts..." id="searchInput">
-            <select class="group-select" id="groupFilter">
-                <option value="">All Groups</option>
-            </select>
+        <!-- Prompts Tab -->
+        <div class="tab-content active" id="promptsTab">
+            <div class="filter-bar">
+                <input type="text" class="search-input" placeholder="Search prompts..." id="promptSearchInput">
+                <select class="group-select" id="promptGroupFilter">
+                    <option value="">All Groups</option>
+                </select>
+                <button class="btn btn-primary" onclick="showCreatePromptModal()">
+                    <i class="fa-solid fa-plus"></i> New Prompt
+                </button>
+            </div>
+            <div class="prompt-grid" id="promptGrid">
+                <div class="empty-state">
+                    <i class="fa-solid fa-book"></i>
+                    <p>Loading prompts...</p>
+                </div>
+            </div>
         </div>
 
-        <div class="prompt-grid" id="promptGrid">
-            <div class="empty-state">
-                <i class="fa-solid fa-book"></i>
-                <p>Loading prompts...</p>
+        <!-- Skills Tab -->
+        <div class="tab-content" id="skillsTab">
+            <div class="filter-bar">
+                <input type="text" class="search-input" placeholder="Search skills..." id="skillSearchInput">
+                <select class="group-select" id="skillGroupFilter">
+                    <option value="">All Groups</option>
+                </select>
+                <button class="btn btn-skill" onclick="showCreateSkillModal()">
+                    <i class="fa-solid fa-plus"></i> New Skill
+                </button>
+            </div>
+            <div class="prompt-grid" id="skillGrid">
+                <div class="empty-state">
+                    <i class="fa-solid fa-bolt"></i>
+                    <p>Loading skills...</p>
+                </div>
             </div>
         </div>
     </div>
 
+    <!-- Prompt Modal -->
     <div class="modal" id="promptModal">
         <div class="modal-content">
             <div class="modal-header">
-                <h2 id="modalTitle">New Prompt</h2>
-                <button class="modal-close" onclick="closeModal()">&times;</button>
+                <h2 id="promptModalTitle">New Prompt</h2>
+                <button class="modal-close" onclick="closePromptModal()">&times;</button>
             </div>
             <form id="promptForm">
                 <input type="hidden" id="promptId">
@@ -727,34 +960,102 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
                 </div>
                 <div class="form-group">
                     <label>Group</label>
-                    <input type="text" id="promptGroup" value="General" list="groupSuggestions" placeholder="e.g., Code Review, Writing, Analysis">
-                    <datalist id="groupSuggestions"></datalist>
+                    <input type="text" id="promptGroup" value="General" list="promptGroupSuggestions" placeholder="e.g., Code Review, Writing, Analysis">
+                    <datalist id="promptGroupSuggestions"></datalist>
                 </div>
                 <div class="form-group">
                     <label>Description (optional)</label>
                     <input type="text" id="promptDescription" placeholder="Brief description of when to use this prompt">
                 </div>
                 <div class="form-group">
-                    <label>Content * <span id="charCount" style="float: right; font-weight: normal; color: #666;">0 / 50,000</span></label>
-                    <textarea id="promptContent" required placeholder="Enter your prompt template..." oninput="updateCharCount()"></textarea>
+                    <label>Content * <span id="promptCharCount" style="float: right; font-weight: normal; color: #666;">0 / 50,000</span></label>
+                    <textarea id="promptContent" required placeholder="Enter your prompt template..." oninput="updatePromptCharCount()"></textarea>
                 </div>
                 <div style="display: flex; gap: 12px; justify-content: flex-end;">
-                    <button type="button" class="btn btn-danger" id="deleteBtn" onclick="deletePrompt()" style="display: none; margin-right: auto;">Delete</button>
-                    <button type="button" class="btn" onclick="closeModal()">Cancel</button>
+                    <button type="button" class="btn btn-danger" id="promptDeleteBtn" onclick="deletePrompt()" style="display: none; margin-right: auto;">Delete</button>
+                    <button type="button" class="btn" onclick="closePromptModal()">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save</button>
                 </div>
             </form>
         </div>
     </div>
 
+    <!-- Skill Modal -->
+    <div class="modal" id="skillModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="skillModalTitle">New Skill</h2>
+                <button class="modal-close" onclick="closeSkillModal()">&times;</button>
+            </div>
+            <form id="skillForm">
+                <input type="hidden" id="skillId">
+                <div class="form-group">
+                    <label>Name *</label>
+                    <input type="text" id="skillName" required placeholder="e.g., Code Review Focus">
+                </div>
+                <div class="form-group">
+                    <label>Group</label>
+                    <input type="text" id="skillGroup" value="General" list="skillGroupSuggestions" placeholder="e.g., Engineering, Communication">
+                    <datalist id="skillGroupSuggestions"></datalist>
+                </div>
+                <div class="form-group">
+                    <label>Description (optional)</label>
+                    <input type="text" id="skillDescription" placeholder="Brief description of what this skill adds">
+                </div>
+                <div class="form-group">
+                    <label>Content * <span id="skillCharCount" style="float: right; font-weight: normal; color: #666;">0 / 50,000</span></label>
+                    <textarea id="skillContent" required placeholder="Enter your skill content..." oninput="updateSkillCharCount()"></textarea>
+                </div>
+                <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                    <button type="button" class="btn btn-danger" id="skillDeleteBtn" onclick="deleteSkill()" style="display: none; margin-right: auto;">Delete</button>
+                    <button type="button" class="btn" onclick="closeSkillModal()">Cancel</button>
+                    <button type="submit" class="btn btn-skill">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
+        // State
+        let activeTab = 'prompts';
         let prompts = [];
-        let groups = [];
+        let promptGroups = [];
         let currentPromptId = null;
+        let skills = [];
+        let skillGroups = [];
+        let currentSkillId = null;
+
+        // Tab switching
+        function switchTab(tab) {
+            activeTab = tab;
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.tab === tab);
+            });
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.toggle('active', content.id === tab + 'Tab');
+            });
+
+            // Load data for the tab if not already loaded
+            if (tab === 'prompts' && prompts.length === 0) {
+                loadPrompts();
+                loadPromptGroups();
+            } else if (tab === 'skills' && skills.length === 0) {
+                loadSkills();
+                loadSkillGroups();
+            }
+        }
+
+        // Check URL for tab parameter
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('tab') === 'skills') {
+            switchTab('skills');
+        }
+
+        // ============== PROMPTS ==============
 
         async function loadPrompts() {
-            const search = document.getElementById('searchInput').value;
-            const group = document.getElementById('groupFilter').value;
+            const search = document.getElementById('promptSearchInput').value;
+            const group = document.getElementById('promptGroupFilter').value;
 
             let url = '/api/prompts';
             const params = new URLSearchParams();
@@ -771,24 +1072,24 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             }
         }
 
-        async function loadGroups() {
+        async function loadPromptGroups() {
             try {
                 const response = await fetch('/api/prompts/groups');
                 const data = await response.json();
-                groups = data.groups;
+                promptGroups = data.groups;
 
-                const select = document.getElementById('groupFilter');
-                const datalist = document.getElementById('groupSuggestions');
+                const select = document.getElementById('promptGroupFilter');
+                const datalist = document.getElementById('promptGroupSuggestions');
 
                 select.innerHTML = '<option value="">All Groups</option>';
                 datalist.innerHTML = '';
 
-                groups.forEach(g => {
+                promptGroups.forEach(g => {
                     select.innerHTML += '<option value="' + escapeHtml(g) + '">' + escapeHtml(g) + '</option>';
                     datalist.innerHTML += '<option value="' + escapeHtml(g) + '">';
                 });
             } catch (error) {
-                console.error('Error loading groups:', error);
+                console.error('Error loading prompt groups:', error);
             }
         }
 
@@ -812,38 +1113,25 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             `).join('');
         }
 
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        function showMessage(text, type) {
-            const msg = document.getElementById('message');
-            msg.textContent = text;
-            msg.className = 'message ' + type;
-            setTimeout(() => msg.className = 'message', 3000);
-        }
-
-        function updateCharCount() {
+        function updatePromptCharCount() {
             const content = document.getElementById('promptContent').value;
             const count = content.length;
-            const charCount = document.getElementById('charCount');
+            const charCount = document.getElementById('promptCharCount');
             charCount.textContent = count.toLocaleString() + ' / 50,000';
             charCount.style.color = count > 50000 ? '#e57373' : (count > 40000 ? '#ffb74d' : '#666');
         }
 
-        function showCreateModal() {
+        function showCreatePromptModal() {
             currentPromptId = null;
-            document.getElementById('modalTitle').textContent = 'New Prompt';
+            document.getElementById('promptModalTitle').textContent = 'New Prompt';
             document.getElementById('promptId').value = '';
             document.getElementById('promptName').value = '';
             document.getElementById('promptGroup').value = 'General';
             document.getElementById('promptDescription').value = '';
             document.getElementById('promptContent').value = '';
-            document.getElementById('deleteBtn').style.display = 'none';
+            document.getElementById('promptDeleteBtn').style.display = 'none';
             document.getElementById('promptModal').classList.add('active');
-            updateCharCount();
+            updatePromptCharCount();
         }
 
         function editPrompt(id) {
@@ -851,18 +1139,18 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             if (!prompt) return;
 
             currentPromptId = id;
-            document.getElementById('modalTitle').textContent = 'Edit Prompt';
+            document.getElementById('promptModalTitle').textContent = 'Edit Prompt';
             document.getElementById('promptId').value = prompt.id;
             document.getElementById('promptName').value = prompt.name;
             document.getElementById('promptGroup').value = prompt.group;
             document.getElementById('promptDescription').value = prompt.description || '';
             document.getElementById('promptContent').value = prompt.content;
-            document.getElementById('deleteBtn').style.display = 'block';
+            document.getElementById('promptDeleteBtn').style.display = 'block';
             document.getElementById('promptModal').classList.add('active');
-            updateCharCount();
+            updatePromptCharCount();
         }
 
-        function closeModal() {
+        function closePromptModal() {
             document.getElementById('promptModal').classList.remove('active');
             currentPromptId = null;
         }
@@ -875,9 +1163,9 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
                 const response = await fetch('/api/prompts/' + currentPromptId, { method: 'DELETE' });
                 if (response.ok) {
                     showMessage('Prompt deleted', 'success');
-                    closeModal();
+                    closePromptModal();
                     loadPrompts();
-                    loadGroups();
+                    loadPromptGroups();
                 } else {
                     const error = await response.json();
                     showMessage(error.detail || 'Error deleting prompt', 'error');
@@ -893,7 +1181,6 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             const id = document.getElementById('promptId').value;
             const content = document.getElementById('promptContent').value;
 
-            // Client-side validation for content length
             if (content.length > 50000) {
                 showMessage('Content is too long (' + content.length + ' chars). Max: 50,000 characters.', 'error');
                 return;
@@ -918,23 +1205,15 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
 
                 if (response.ok) {
                     showMessage(id ? 'Prompt updated' : 'Prompt created', 'success');
-                    closeModal();
+                    closePromptModal();
                     loadPrompts();
-                    loadGroups();
+                    loadPromptGroups();
                 } else {
-                    // Handle both JSON and non-JSON error responses
                     let errorMsg = 'Error saving prompt';
                     const contentType = response.headers.get('content-type');
                     if (contentType && contentType.includes('application/json')) {
                         const error = await response.json();
                         errorMsg = error.detail || errorMsg;
-                    } else {
-                        const text = await response.text();
-                        if (response.status === 422) {
-                            errorMsg = 'Validation error: Check content length (max 50,000 chars) and required fields';
-                        } else {
-                            errorMsg = 'Server error (' + response.status + '): ' + (text.substring(0, 100) || 'Unknown error');
-                        }
                     }
                     showMessage(errorMsg, 'error');
                 }
@@ -943,22 +1222,218 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
             }
         });
 
-        let searchTimeout;
-        document.getElementById('searchInput').addEventListener('input', () => {
-            clearTimeout(searchTimeout);
-            searchTimeout = setTimeout(loadPrompts, 300);
+        // ============== SKILLS ==============
+
+        async function loadSkills() {
+            const search = document.getElementById('skillSearchInput').value;
+            const group = document.getElementById('skillGroupFilter').value;
+
+            let url = '/api/skills';
+            const params = new URLSearchParams();
+            if (search) params.set('search', search);
+            if (group) params.set('group', group);
+            if (params.toString()) url += '?' + params.toString();
+
+            try {
+                const response = await fetch(url);
+                skills = await response.json();
+                renderSkills();
+            } catch (error) {
+                showMessage('Error loading skills: ' + error.message, 'error');
+            }
+        }
+
+        async function loadSkillGroups() {
+            try {
+                const response = await fetch('/api/skills/groups');
+                const data = await response.json();
+                skillGroups = data.groups;
+
+                const select = document.getElementById('skillGroupFilter');
+                const datalist = document.getElementById('skillGroupSuggestions');
+
+                select.innerHTML = '<option value="">All Groups</option>';
+                datalist.innerHTML = '';
+
+                skillGroups.forEach(g => {
+                    select.innerHTML += '<option value="' + escapeHtml(g) + '">' + escapeHtml(g) + '</option>';
+                    datalist.innerHTML += '<option value="' + escapeHtml(g) + '">';
+                });
+            } catch (error) {
+                console.error('Error loading skill groups:', error);
+            }
+        }
+
+        function renderSkills() {
+            const grid = document.getElementById('skillGrid');
+            if (skills.length === 0) {
+                grid.innerHTML = '<div class="empty-state"><i class="fa-solid fa-bolt"></i><p>No skills found. Create your first skill!</p></div>';
+                return;
+            }
+
+            grid.innerHTML = skills.map(s => `
+                <div class="prompt-card skill-card" onclick="editSkill(${s.id})">
+                    <div class="prompt-name">${escapeHtml(s.name)}</div>
+                    ${s.description ? '<div class="prompt-description">' + escapeHtml(s.description) + '</div>' : ''}
+                    <div class="prompt-content">${escapeHtml(s.content)}</div>
+                    <div class="prompt-meta">
+                        <span class="prompt-group-badge skill-group-badge">${escapeHtml(s.group)}</span>
+                        <span>Used ${s.usage_count} times</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function updateSkillCharCount() {
+            const content = document.getElementById('skillContent').value;
+            const count = content.length;
+            const charCount = document.getElementById('skillCharCount');
+            charCount.textContent = count.toLocaleString() + ' / 50,000';
+            charCount.style.color = count > 50000 ? '#e57373' : (count > 40000 ? '#ffb74d' : '#666');
+        }
+
+        function showCreateSkillModal() {
+            currentSkillId = null;
+            document.getElementById('skillModalTitle').textContent = 'New Skill';
+            document.getElementById('skillId').value = '';
+            document.getElementById('skillName').value = '';
+            document.getElementById('skillGroup').value = 'General';
+            document.getElementById('skillDescription').value = '';
+            document.getElementById('skillContent').value = '';
+            document.getElementById('skillDeleteBtn').style.display = 'none';
+            document.getElementById('skillModal').classList.add('active');
+            updateSkillCharCount();
+        }
+
+        function editSkill(id) {
+            const skill = skills.find(s => s.id === id);
+            if (!skill) return;
+
+            currentSkillId = id;
+            document.getElementById('skillModalTitle').textContent = 'Edit Skill';
+            document.getElementById('skillId').value = skill.id;
+            document.getElementById('skillName').value = skill.name;
+            document.getElementById('skillGroup').value = skill.group;
+            document.getElementById('skillDescription').value = skill.description || '';
+            document.getElementById('skillContent').value = skill.content;
+            document.getElementById('skillDeleteBtn').style.display = 'block';
+            document.getElementById('skillModal').classList.add('active');
+            updateSkillCharCount();
+        }
+
+        function closeSkillModal() {
+            document.getElementById('skillModal').classList.remove('active');
+            currentSkillId = null;
+        }
+
+        async function deleteSkill() {
+            if (!currentSkillId) return;
+            if (!confirm('Delete this skill?')) return;
+
+            try {
+                const response = await fetch('/api/skills/' + currentSkillId, { method: 'DELETE' });
+                if (response.ok) {
+                    showMessage('Skill deleted', 'success');
+                    closeSkillModal();
+                    loadSkills();
+                    loadSkillGroups();
+                } else {
+                    const error = await response.json();
+                    showMessage(error.detail || 'Error deleting skill', 'error');
+                }
+            } catch (error) {
+                showMessage('Error: ' + error.message, 'error');
+            }
+        }
+
+        document.getElementById('skillForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const id = document.getElementById('skillId').value;
+            const content = document.getElementById('skillContent').value;
+
+            if (content.length > 50000) {
+                showMessage('Content is too long (' + content.length + ' chars). Max: 50,000 characters.', 'error');
+                return;
+            }
+
+            const data = {
+                name: document.getElementById('skillName').value,
+                group: document.getElementById('skillGroup').value,
+                description: document.getElementById('skillDescription').value,
+                content: content
+            };
+
+            const url = id ? '/api/skills/' + id : '/api/skills';
+            const method = id ? 'PATCH' : 'POST';
+
+            try {
+                const response = await fetch(url, {
+                    method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                if (response.ok) {
+                    showMessage(id ? 'Skill updated' : 'Skill created', 'success');
+                    closeSkillModal();
+                    loadSkills();
+                    loadSkillGroups();
+                } else {
+                    let errorMsg = 'Error saving skill';
+                    const contentType = response.headers.get('content-type');
+                    if (contentType && contentType.includes('application/json')) {
+                        const error = await response.json();
+                        errorMsg = error.detail || errorMsg;
+                    }
+                    showMessage(errorMsg, 'error');
+                }
+            } catch (error) {
+                showMessage('Error: ' + error.message, 'error');
+            }
         });
 
-        document.getElementById('groupFilter').addEventListener('change', loadPrompts);
+        // ============== COMMON ==============
 
-        // Close modal on outside click
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function showMessage(text, type) {
+            const msg = document.getElementById('message');
+            msg.textContent = text;
+            msg.className = 'message ' + type;
+            setTimeout(() => msg.className = 'message', 3000);
+        }
+
+        // Search handlers
+        let promptSearchTimeout;
+        document.getElementById('promptSearchInput').addEventListener('input', () => {
+            clearTimeout(promptSearchTimeout);
+            promptSearchTimeout = setTimeout(loadPrompts, 300);
+        });
+        document.getElementById('promptGroupFilter').addEventListener('change', loadPrompts);
+
+        let skillSearchTimeout;
+        document.getElementById('skillSearchInput').addEventListener('input', () => {
+            clearTimeout(skillSearchTimeout);
+            skillSearchTimeout = setTimeout(loadSkills, 300);
+        });
+        document.getElementById('skillGroupFilter').addEventListener('change', loadSkills);
+
+        // Close modals on outside click
         document.getElementById('promptModal').addEventListener('click', (e) => {
-            if (e.target.id === 'promptModal') closeModal();
+            if (e.target.id === 'promptModal') closePromptModal();
+        });
+        document.getElementById('skillModal').addEventListener('click', (e) => {
+            if (e.target.id === 'skillModal') closeSkillModal();
         });
 
         // Initial load
         loadPrompts();
-        loadGroups();
+        loadPromptGroups();
     </script>
 </body>
 </html>
@@ -967,8 +1442,16 @@ async def prompt_library_page(current_user: User = Depends(get_current_user)):
 
 
 @router.get("/settings", response_class=HTMLResponse)
-async def settings_page(current_user: User = Depends(get_current_user)):
+async def settings_page(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+):
     """Serve the settings page."""
+    from app.routers.api import get_site_setting
+    show_token_wheel = get_site_setting(session, "show_token_wheel", "false") == "true"
+    proactive_build = get_site_setting(session, "proactive_build_after_ticket", "false") == "true"
+    is_engineer_or_admin = current_user.role == "engineer" or current_user.is_admin
+
     html = f"""
 <!DOCTYPE html>
 <html>
@@ -978,14 +1461,14 @@ async def settings_page(current_user: User = Depends(get_current_user)):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
         :root {{
-            --bg-color: #1a1a1a;
-            --chat-bg: #2d2d2d;
+            --bg-color: #0d0d1a;
+            --chat-bg: #1a1730;
             --text-color: #e0e0e0;
-            --border-color: #404040;
-            --accent-color: #4CAF50;
+            --border-color: rgba(139, 92, 246, 0.2);
+            --accent-color: #8b5cf6;
         }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             margin: 0;
@@ -1017,7 +1500,7 @@ async def settings_page(current_user: User = Depends(get_current_user)):
             transition: background 0.2s;
         }}
         .back-btn:hover {{
-            background: var(--border-color);
+            background: rgba(139, 92, 246, 0.15);
         }}
         h1 {{
             font-size: 1.5rem;
@@ -1032,7 +1515,7 @@ async def settings_page(current_user: User = Depends(get_current_user)):
         }}
         .card-header {{
             font-size: 0.85rem;
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
             text-transform: uppercase;
             letter-spacing: 0.5px;
             margin-bottom: 16px;
@@ -1060,13 +1543,13 @@ async def settings_page(current_user: User = Depends(get_current_user)):
         }}
         .user-details .role {{
             font-size: 0.85rem;
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
         }}
         .badge {{
             display: inline-block;
             padding: 2px 8px;
-            background: rgba(76, 175, 80, 0.2);
-            color: var(--accent-color);
+            background: rgba(139, 92, 246, 0.2);
+            color: #a78bfa;
             border-radius: 4px;
             font-size: 0.75rem;
             margin-left: 8px;
@@ -1095,7 +1578,7 @@ async def settings_page(current_user: User = Depends(get_current_user)):
             flex: 1;
         }}
         .menu-item .chevron {{
-            color: #666;
+            color: rgba(255, 255, 255, 0.35);
         }}
         .logout-btn {{
             display: flex;
@@ -1104,16 +1587,16 @@ async def settings_page(current_user: User = Depends(get_current_user)):
             gap: 10px;
             width: 100%;
             padding: 14px;
-            background: #d32f2f;
-            border: none;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.25);
             border-radius: 8px;
-            color: white;
+            color: #ef4444;
             font-size: 1rem;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: all 0.2s;
         }}
         .logout-btn:hover {{
-            background: #b71c1c;
+            background: rgba(239, 68, 68, 0.25);
         }}
         a {{
             color: inherit;
@@ -1153,6 +1636,79 @@ async def settings_page(current_user: User = Depends(get_current_user)):
         {"<div class='card'><div class='card-header'>Automation</div><a href='/scheduled-jobs' class='menu-item'><i class='fa-solid fa-clock'></i><span>Scheduled Jobs</span><i class='fa-solid fa-chevron-right chevron'></i></a></div>" if current_user.role == 'engineer' or current_user.is_admin else ""}
 
         <div class="card">
+            <div class="card-header">Backup</div>
+            <a href="/backup-history" target="_blank" class="menu-item">
+                <i class="fa-solid fa-clock-rotate-left"></i>
+                <span>Backup History</span>
+                <i class="fa-solid fa-chevron-right chevron"></i>
+            </a>
+            <div class="menu-item" style="cursor: default;">
+                <i class="fa-solid fa-cloud-arrow-up"></i>
+                <span>Auto-backup on completion</span>
+                <label style="position: relative; display: inline-block; width: 44px; height: 24px;">
+                    <input type="checkbox" id="autoBackupToggle" style="opacity: 0; width: 0; height: 0;"
+                        onchange="toggleAutoBackup(this.checked)">
+                    <span style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #555; border-radius: 24px; transition: 0.3s;"></span>
+                    <span id="autoBackupSlider" style="position: absolute; content: ''; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; border-radius: 50%; transition: 0.3s;"></span>
+                </label>
+            </div>
+            <div style="padding: 4px 0 0 36px; font-size: 0.75rem; color: rgba(255,255,255,0.35);">
+                Runs cloud backup after each task completes
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">App Preview</div>
+            <div class="menu-item" style="cursor: default;">
+                <i class="fa-solid fa-arrows-rotate"></i>
+                <span>Auto-refresh on edits</span>
+                <label style="position: relative; display: inline-block; width: 44px; height: 24px;">
+                    <input type="checkbox" id="autoRefreshOnEditToggle" style="opacity: 0; width: 0; height: 0;"
+                        onchange="toggleAutoRefreshOnEdit(this.checked)">
+                    <span style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #555; border-radius: 24px; transition: 0.3s;"></span>
+                    <span id="autoRefreshOnEditSlider" style="position: absolute; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; border-radius: 50%; transition: 0.3s;"></span>
+                </label>
+            </div>
+            <div style="padding: 4px 0 0 36px; font-size: 0.75rem; color: rgba(255,255,255,0.35);">
+                Reloads the app preview iframe after each edit_file or write_file tool call
+            </div>
+        </div>
+
+        {"" if not is_engineer_or_admin else '''<div class="card">
+            <div class="card-header">Display</div>
+            <div class="menu-item" style="cursor: default;">
+                <i class="fa-solid fa-chart-pie"></i>
+                <span>Show Token Wheel</span>
+                <label style="position: relative; display: inline-block; width: 44px; height: 24px;">
+                    <input type="checkbox" id="tokenWheelToggle" style="opacity: 0; width: 0; height: 0;"
+                        onchange="toggleTokenWheel(this.checked)">
+                    <span style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #555; border-radius: 24px; transition: 0.3s;"></span>
+                    <span id="tokenWheelSlider" style="position: absolute; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; border-radius: 50%; transition: 0.3s;"></span>
+                </label>
+            </div>
+            <div style="padding: 4px 0 0 36px; font-size: 0.75rem; color: rgba(255,255,255,0.35);">
+                Shows context window usage percentage in chat
+            </div>
+        </div>'''}
+
+        {"" if not is_engineer_or_admin else f'''<div class="card">
+            <div class="card-header">Automation</div>
+            <div class="menu-item" style="cursor: default;">
+                <i class="fa-solid fa-bolt"></i>
+                <span>Proactively Build After Ticket</span>
+                <label style="position: relative; display: inline-block; width: 44px; height: 24px;">
+                    <input type="checkbox" id="proactiveBuildToggle" style="opacity: 0; width: 0; height: 0;"
+                        onchange="toggleProactiveBuild(this.checked)">
+                    <span style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #555; border-radius: 24px; transition: 0.3s;"></span>
+                    <span id="proactiveBuildSlider" style="position: absolute; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; border-radius: 50%; transition: 0.3s;"></span>
+                </label>
+            </div>
+            <div style="padding: 4px 0 0 36px; font-size: 0.75rem; color: rgba(255,255,255,0.35);">
+                Automatically switches to Engineer mode and starts building after a ticket is written
+            </div>
+        </div>'''}
+
+        <div class="card">
             <button class="logout-btn" onclick="logout()">
                 <i class="fa-solid fa-right-from-bracket"></i>
                 Sign Out
@@ -1161,6 +1717,123 @@ async def settings_page(current_user: User = Depends(get_current_user)):
     </div>
 
     <script>
+        // Auto-backup toggle
+        (function() {{
+            const toggle = document.getElementById('autoBackupToggle');
+            const slider = document.getElementById('autoBackupSlider');
+            const isEnabled = localStorage.getItem('autoBackupEnabled') !== 'false';
+            toggle.checked = isEnabled;
+            updateSliderStyle(isEnabled);
+        }})();
+
+        function toggleAutoBackup(enabled) {{
+            localStorage.setItem('autoBackupEnabled', enabled ? 'true' : 'false');
+            updateSliderStyle(enabled);
+        }}
+
+        function updateSliderStyle(enabled) {{
+            const slider = document.getElementById('autoBackupSlider');
+            const track = slider.previousElementSibling;
+            if (enabled) {{
+                track.style.backgroundColor = '#8b5cf6';
+                slider.style.transform = 'translateX(20px)';
+            }} else {{
+                track.style.backgroundColor = '#555';
+                slider.style.transform = 'translateX(0)';
+            }}
+        }}
+
+        // Auto-refresh on edit toggle (defaults to enabled)
+        (function() {{
+            const toggle = document.getElementById('autoRefreshOnEditToggle');
+            if (!toggle) return;
+            const isEnabled = localStorage.getItem('autoRefreshOnEdit') !== 'false';
+            toggle.checked = isEnabled;
+            updateAutoRefreshOnEditSlider(isEnabled);
+        }})();
+
+        function toggleAutoRefreshOnEdit(enabled) {{
+            localStorage.setItem('autoRefreshOnEdit', enabled ? 'true' : 'false');
+            updateAutoRefreshOnEditSlider(enabled);
+        }}
+
+        function updateAutoRefreshOnEditSlider(enabled) {{
+            const slider = document.getElementById('autoRefreshOnEditSlider');
+            if (!slider) return;
+            const track = slider.previousElementSibling;
+            if (enabled) {{
+                track.style.backgroundColor = '#8b5cf6';
+                slider.style.transform = 'translateX(20px)';
+            }} else {{
+                track.style.backgroundColor = '#555';
+                slider.style.transform = 'translateX(0)';
+            }}
+        }}
+
+        // Token wheel toggle
+        (function() {{
+            const toggle = document.getElementById('tokenWheelToggle');
+            const slider = document.getElementById('tokenWheelSlider');
+            if (!toggle || !slider) return;
+            const isEnabled = {'true' if show_token_wheel else 'false'};
+            toggle.checked = isEnabled;
+            updateTokenWheelSlider(isEnabled);
+        }})();
+
+        function toggleTokenWheel(enabled) {{
+            updateTokenWheelSlider(enabled);
+            fetch('/api/site-settings/show_token_wheel', {{
+                method: 'PUT',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ value: enabled ? 'true' : 'false' }})
+            }});
+        }}
+
+        function updateTokenWheelSlider(enabled) {{
+            const slider = document.getElementById('tokenWheelSlider');
+            if (!slider) return;
+            const track = slider.previousElementSibling;
+            if (enabled) {{
+                track.style.backgroundColor = '#8b5cf6';
+                slider.style.transform = 'translateX(20px)';
+            }} else {{
+                track.style.backgroundColor = '#555';
+                slider.style.transform = 'translateX(0)';
+            }}
+        }}
+
+        // Proactive build toggle
+        (function() {{
+            const toggle = document.getElementById('proactiveBuildToggle');
+            const slider = document.getElementById('proactiveBuildSlider');
+            if (!toggle || !slider) return;
+            const isEnabled = {'true' if proactive_build else 'false'};
+            toggle.checked = isEnabled;
+            updateProactiveBuildSlider(isEnabled);
+        }})();
+
+        function toggleProactiveBuild(enabled) {{
+            updateProactiveBuildSlider(enabled);
+            fetch('/api/site-settings/proactive_build_after_ticket', {{
+                method: 'PUT',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ value: enabled ? 'true' : 'false' }})
+            }});
+        }}
+
+        function updateProactiveBuildSlider(enabled) {{
+            const slider = document.getElementById('proactiveBuildSlider');
+            if (!slider) return;
+            const track = slider.previousElementSibling;
+            if (enabled) {{
+                track.style.backgroundColor = '#8b5cf6';
+                slider.style.transform = 'translateX(20px)';
+            }} else {{
+                track.style.backgroundColor = '#555';
+                slider.style.transform = 'translateX(0)';
+            }}
+        }}
+
         function logout() {{
             // Clear credentials by making a request that will fail, then redirect
             fetch('/logout', {{
@@ -1182,15 +1855,19 @@ async def settings_page(current_user: User = Depends(get_current_user)):
 
 @router.post("/logout")
 async def logout():
+    """Logout endpoint.
+
+    Clears the session cookie *and* returns 401 with WWW-Authenticate: Basic
+    so any browser still relying on cached Basic creds also gets evicted.
+    Both auth modes are cleared in one shot.
     """
-    Logout endpoint - returns 401 to clear browser's cached credentials.
-    The browser will prompt for new credentials on the next request.
-    """
-    raise HTTPException(
+    response = JSONResponse(
+        {"detail": "Logged out"},
         status_code=401,
-        detail="Logged out",
-        headers={"WWW-Authenticate": "Basic"}
+        headers={"WWW-Authenticate": "Basic"},
     )
+    response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+    return response
 
 
 @router.get("/leonardo-md", response_class=HTMLResponse)
@@ -1207,14 +1884,14 @@ async def leonardo_md_page(current_user: User = Depends(get_current_user)):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
         :root {{
-            --bg-color: #1a1a1a;
-            --chat-bg: #2d2d2d;
+            --bg-color: #0d0d1a;
+            --chat-bg: #1a1730;
             --text-color: #e0e0e0;
-            --border-color: #404040;
-            --accent-color: #4CAF50;
+            --border-color: rgba(139, 92, 246, 0.2);
+            --accent-color: #8b5cf6;
         }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             margin: 0;
@@ -1246,7 +1923,7 @@ async def leonardo_md_page(current_user: User = Depends(get_current_user)):
             transition: background 0.2s;
         }}
         .back-btn:hover {{
-            background: var(--border-color);
+            background: rgba(139, 92, 246, 0.15);
         }}
         h1 {{
             font-size: 1.5rem;
@@ -1261,7 +1938,7 @@ async def leonardo_md_page(current_user: User = Depends(get_current_user)):
         }}
         .card-header {{
             font-size: 0.85rem;
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
             text-transform: uppercase;
             letter-spacing: 0.5px;
             margin-bottom: 16px;
@@ -1271,7 +1948,7 @@ async def leonardo_md_page(current_user: User = Depends(get_current_user)):
         }}
         .card-header-note {{
             font-size: 0.75rem;
-            color: #666;
+            color: rgba(255, 255, 255, 0.35);
             text-transform: none;
             letter-spacing: normal;
         }}
@@ -1291,7 +1968,8 @@ async def leonardo_md_page(current_user: User = Depends(get_current_user)):
         }}
         textarea:focus {{
             outline: none;
-            border-color: var(--accent-color);
+            border-color: rgba(139, 92, 246, 0.4);
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.08);
         }}
         textarea:read-only {{
             opacity: 0.7;
@@ -1306,17 +1984,17 @@ async def leonardo_md_page(current_user: User = Depends(get_current_user)):
             display: inline-flex;
             align-items: center;
             gap: 8px;
-            transition: background 0.2s;
+            transition: all 0.2s;
         }}
         .btn-primary {{
-            background: var(--accent-color);
+            background: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%);
             color: white;
         }}
         .btn-primary:hover {{
-            background: #45a049;
+            opacity: 0.9;
         }}
         .btn-primary:disabled {{
-            background: #666;
+            opacity: 0.5;
             cursor: not-allowed;
         }}
         .actions {{
@@ -1333,18 +2011,18 @@ async def leonardo_md_page(current_user: User = Depends(get_current_user)):
         }}
         .message.success {{
             display: block;
-            background: rgba(76, 175, 80, 0.2);
-            color: #81c784;
-            border: 1px solid rgba(76, 175, 80, 0.3);
+            background: rgba(34, 197, 94, 0.1);
+            color: #22c55e;
+            border: 1px solid rgba(34, 197, 94, 0.25);
         }}
         .message.error {{
             display: block;
-            background: rgba(244, 67, 54, 0.2);
-            color: #e57373;
-            border: 1px solid rgba(244, 67, 54, 0.3);
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.25);
         }}
         .read-only-notice {{
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
             font-size: 0.85rem;
             margin-top: 12px;
             display: flex;
@@ -1467,17 +2145,17 @@ async def git_history_page(current_user: User = Depends(get_current_user)):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
         :root {
-            --bg-color: #1a1a1a;
-            --panel-bg: #2d2d2d;
+            --bg-color: #0d0d1a;
+            --panel-bg: #1a1730;
             --text-color: #e0e0e0;
-            --text-secondary: #888;
-            --border-color: #404040;
+            --text-secondary: rgba(255, 255, 255, 0.5);
+            --border-color: rgba(139, 92, 246, 0.2);
             --accent-color: #8b5cf6;
             --accent-hover: #7c3aed;
         }
         * { box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             margin: 0;
@@ -1507,7 +2185,7 @@ async def git_history_page(current_user: User = Depends(get_current_user)):
             text-decoration: none;
             transition: all 0.2s;
         }
-        .back-btn:hover { background: var(--border-color); }
+        .back-btn:hover { background: rgba(139, 92, 246, 0.15); }
         h1 { font-size: 1.3rem; margin: 0; flex: 1; }
         .header-actions { display: flex; gap: 8px; }
         .btn {
@@ -1523,10 +2201,10 @@ async def git_history_page(current_user: User = Depends(get_current_user)):
             align-items: center;
             gap: 6px;
         }
-        .btn:hover { background: var(--border-color); }
+        .btn:hover { background: rgba(139, 92, 246, 0.15); }
         .btn-primary {
-            background: var(--accent-color);
-            border-color: var(--accent-color);
+            background: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%);
+            border-color: #8b5cf6;
             color: white;
         }
         .btn-primary:hover { background: var(--accent-hover); }
@@ -2411,14 +3089,14 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
         :root {
-            --bg-color: #1a1a1a;
-            --chat-bg: #2d2d2d;
+            --bg-color: #0d0d1a;
+            --chat-bg: #1a1730;
             --text-color: #e0e0e0;
-            --border-color: #404040;
-            --accent-color: #4CAF50;
+            --border-color: rgba(139, 92, 246, 0.2);
+            --accent-color: #8b5cf6;
         }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             margin: 0;
@@ -2449,7 +3127,7 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
             text-decoration: none;
             transition: background 0.2s;
         }
-        .back-btn:hover { background: var(--border-color); }
+        .back-btn:hover { background: rgba(139, 92, 246, 0.15); }
         h1 { font-size: 1.5rem; margin: 0; flex: 1; }
         .card {
             background: var(--chat-bg);
@@ -2460,7 +3138,7 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
         }
         .card-header {
             font-size: 0.85rem;
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
             text-transform: uppercase;
             letter-spacing: 0.5px;
             margin-bottom: 16px;
@@ -2470,7 +3148,7 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
         }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border-color); }
-        th { color: #888; font-weight: 500; font-size: 0.85rem; }
+        th { color: rgba(255, 255, 255, 0.5); font-weight: 500; font-size: 0.85rem; }
         tr:last-child td { border-bottom: none; }
         .badge {
             padding: 4px 10px;
@@ -2479,13 +3157,13 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
             font-weight: 500;
             text-transform: uppercase;
         }
-        .badge-enabled { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-        .badge-disabled { background: rgba(244, 67, 54, 0.2); color: #e57373; }
-        .badge-completed { background: rgba(76, 175, 80, 0.2); color: #81c784; }
-        .badge-running { background: rgba(33, 150, 243, 0.2); color: #64b5f6; }
-        .badge-failed { background: rgba(244, 67, 54, 0.2); color: #e57373; }
-        .badge-timeout { background: rgba(255, 152, 0, 0.2); color: #ffb74d; }
-        .badge-pending { background: rgba(158, 158, 158, 0.2); color: #bdbdbd; }
+        .badge-enabled { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+        .badge-disabled { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+        .badge-completed { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+        .badge-running { background: rgba(139, 92, 246, 0.2); color: #a78bfa; }
+        .badge-failed { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+        .badge-timeout { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+        .badge-pending { background: rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.5); }
         .btn {
             padding: 6px 12px;
             border: 1px solid var(--border-color);
@@ -2497,18 +3175,18 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
             color: var(--text-color);
             transition: all 0.2s;
         }
-        .btn:hover { background: var(--border-color); }
+        .btn:hover { background: rgba(139, 92, 246, 0.15); }
         .btn-primary {
-            background: var(--accent-color);
-            border-color: var(--accent-color);
+            background: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%);
+            border-color: #8b5cf6;
             color: white;
         }
-        .btn-primary:hover { opacity: 0.9; background: var(--accent-color); }
-        .btn-danger { border-color: #e57373; color: #e57373; }
-        .btn-danger:hover { background: rgba(244, 67, 54, 0.2); }
+        .btn-primary:hover { opacity: 0.9; }
+        .btn-danger { border-color: rgba(239, 68, 68, 0.25); color: #ef4444; }
+        .btn-danger:hover { background: rgba(239, 68, 68, 0.15); }
         .btn-sm { padding: 4px 8px; font-size: 11px; }
         .form-group { margin-bottom: 16px; }
-        .form-group label { display: block; margin-bottom: 6px; font-size: 0.85rem; color: #888; }
+        .form-group label { display: block; margin-bottom: 6px; font-size: 0.85rem; color: rgba(255, 255, 255, 0.5); }
         .form-group input, .form-group select, .form-group textarea {
             width: 100%;
             padding: 10px;
@@ -2521,7 +3199,8 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
         .form-group textarea { min-height: 100px; resize: vertical; }
         .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
             outline: none;
-            border-color: var(--accent-color);
+            border-color: rgba(139, 92, 246, 0.4);
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.08);
         }
         .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
         .message {
@@ -2530,8 +3209,8 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
             margin-bottom: 20px;
             display: none;
         }
-        .message.success { background: rgba(76, 175, 80, 0.2); color: #81c784; display: block; }
-        .message.error { background: rgba(244, 67, 54, 0.2); color: #e57373; display: block; }
+        .message.success { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.25); color: #22c55e; display: block; }
+        .message.error { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.25); color: #ef4444; display: block; }
         .actions { white-space: nowrap; }
         .modal {
             display: none;
@@ -2540,7 +3219,7 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
             left: 0;
             width: 100%;
             height: 100%;
-            background: rgba(0,0,0,0.7);
+            background: rgba(0,0,0,0.8);
             z-index: 1000;
             justify-content: center;
             align-items: center;
@@ -2602,7 +3281,7 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
         .tab-content.active { display: block; }
         .cron-help {
             font-size: 11px;
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
             margin-top: 8px;
         }
         .cron-presets {
@@ -2623,10 +3302,10 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
         }
         .cron-preset:hover {
             border-color: var(--accent-color);
-            background: rgba(76, 175, 80, 0.1);
+            background: rgba(139, 92, 246, 0.1);
         }
         .cron-preset code {
-            color: #81c784;
+            color: #a78bfa;
             margin-left: 4px;
         }
         .toggle {
@@ -2668,7 +3347,7 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
         .empty-state {
             text-align: center;
             padding: 40px;
-            color: #888;
+            color: rgba(255, 255, 255, 0.5);
         }
         .empty-state i { font-size: 48px; margin-bottom: 16px; }
     </style>
@@ -2785,18 +3464,13 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
                     <div class="form-group">
                         <label>Agent</label>
                         <select id="jobAgent" required>
-                            <option value="rails_agent">Rails Agent</option>
-                            <option value="llamabot">LlamaBot</option>
-                            <option value="llamapress">LlamaPress</option>
+                            <option value="">Loading agents…</option>
                         </select>
                     </div>
                     <div class="form-group">
                         <label>Model</label>
                         <select id="jobModel">
-                            <option value="gemini-3-flash">Gemini 3 Flash</option>
-                            <option value="claude-4.5-haiku">Claude 4.5 Haiku</option>
-                            <option value="claude-4.5-sonnet">Claude 4.5 Sonnet</option>
-                            <option value="gpt-4o-mini">GPT-4o Mini</option>
+                            <option value="">Loading models…</option>
                         </select>
                     </div>
                 </div>
@@ -2863,6 +3537,72 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
     <script>
         let jobs = [];
         let runs = [];
+
+        const MODEL_LABELS = {
+            'gemini-3-flash': 'Gemini 3 Flash',
+            'gemini-3-pro': 'Gemini 3 Pro',
+            'claude-4.5-haiku': 'Claude 4.5 Haiku',
+            'claude-4.5-sonnet': 'Claude 4.5 Sonnet',
+            'gpt-5-mini': 'GPT-5 Mini',
+            'gpt-5-codex': 'GPT-5 Codex',
+            'deepseek-v4-flash': 'DeepSeek V4 Flash',
+        };
+
+        function prettyAgentLabel(name) {
+            return name.replace(/_/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+        }
+
+        async function loadAgents() {
+            try {
+                const response = await fetch('/available-agents');
+                const data = await response.json();
+                const sel = document.getElementById('jobAgent');
+                const agents = data.agents || [];
+                sel.innerHTML = agents.map(a =>
+                    `<option value="${a}">${prettyAgentLabel(a)}</option>`
+                ).join('');
+            } catch (e) {
+                console.error('Failed to load agents:', e);
+            }
+        }
+
+        async function loadModels() {
+            try {
+                const response = await fetch('/api/available-models');
+                const data = await response.json();
+                const sel = document.getElementById('jobModel');
+                const models = data.models || [];
+                sel.innerHTML = models.map(m => {
+                    const label = MODEL_LABELS[m.value] || m.value;
+                    const suffix = m.available ? '' : ' (No API Key)';
+                    const disabled = m.available ? '' : 'disabled';
+                    const title = m.reason ? ` title="${m.reason}"` : '';
+                    return `<option value="${m.value}" ${disabled}${title}>${label}${suffix}</option>`;
+                }).join('');
+                const firstAvailable = models.find(m => m.available);
+                if (firstAvailable) sel.value = firstAvailable.value;
+            } catch (e) {
+                console.error('Failed to load models:', e);
+            }
+        }
+
+        // If a saved job's agent/model is no longer in the dropdown (graph removed,
+        // API key revoked, model deprecated), inject it as a disabled option so the
+        // user still sees what was configured and can pick a replacement.
+        function ensureOptionPresent(selectEl, value, labelFallback) {
+            if (!value) return;
+            const existing = Array.from(selectEl.options).find(o => o.value === value);
+            if (existing) {
+                selectEl.value = value;
+                return;
+            }
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = `${labelFallback || value} (unavailable)`;
+            opt.disabled = true;
+            opt.selected = true;
+            selectEl.appendChild(opt);
+        }
 
         async function loadJobs() {
             try {
@@ -2980,6 +3720,9 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
             document.getElementById('modalTitle').textContent = 'Create Job';
             document.getElementById('jobForm').reset();
             document.getElementById('jobId').value = '';
+            // Refresh in background — initial load already populated these on page load.
+            loadAgents();
+            loadModels();
             document.getElementById('jobModal').classList.add('active');
         }
 
@@ -2998,8 +3741,17 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
             document.getElementById('jobId').value = job.id;
             document.getElementById('jobName').value = job.name;
             document.getElementById('jobDescription').value = job.description || '';
-            document.getElementById('jobAgent').value = job.agent_name;
-            document.getElementById('jobModel').value = job.llm_model;
+            await Promise.all([loadAgents(), loadModels()]);
+            ensureOptionPresent(
+                document.getElementById('jobAgent'),
+                job.agent_name,
+                prettyAgentLabel(job.agent_name || '')
+            );
+            ensureOptionPresent(
+                document.getElementById('jobModel'),
+                job.llm_model,
+                MODEL_LABELS[job.llm_model] || job.llm_model
+            );
             document.getElementById('jobPrompt').value = job.prompt;
             document.getElementById('jobCron').value = job.cron_expression;
             document.getElementById('jobTimezone').value = job.timezone;
@@ -3150,6 +3902,208 @@ async def scheduled_jobs_page(user: User = Depends(engineer_or_admin_required)):
 
         // Load data on page load
         loadJobs();
+        loadAgents();
+        loadModels();
+    </script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+
+@router.get("/backup-history", response_class=HTMLResponse)
+async def backup_history_page(current_user: User = Depends(get_current_user)):
+    """Serve the backup history page."""
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Backup History</title>
+    <link rel="icon" type="image/png" href="https://llamapress-ai-image-uploads.s3.us-west-2.amazonaws.com/4bmqe5iolvp84ceyk9ttz8vylrym">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        :root {
+            --bg-color: #0d0d1a;
+            --chat-bg: #1a1730;
+            --text-color: #e0e0e0;
+            --border-color: rgba(139, 92, 246, 0.2);
+            --accent-color: #8b5cf6;
+        }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin: 0;
+        }
+        .backup-entry {
+            background: var(--chat-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .backup-entry.completed {
+            border-left: 3px solid #22c55e;
+        }
+        .backup-entry.failed {
+            border-left: 3px solid #ef4444;
+        }
+        .backup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .backup-status-badge {
+            font-size: 0.8rem;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+        .backup-status-badge.completed {
+            background: rgba(34, 197, 94, 0.15);
+            color: #22c55e;
+        }
+        .backup-status-badge.failed {
+            background: rgba(239, 68, 68, 0.15);
+            color: #ef4444;
+        }
+        .backup-time {
+            font-size: 0.85rem;
+            color: rgba(255, 255, 255, 0.5);
+        }
+        .backup-error {
+            font-size: 0.8rem;
+            color: #ef4444;
+            background: rgba(239, 68, 68, 0.1);
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-top: 8px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .backup-output {
+            font-size: 0.75rem;
+            color: rgba(255, 255, 255, 0.6);
+            background: #0d0d1a;
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-top: 8px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+            word-break: break-all;
+        }
+        .backup-output summary {
+            cursor: pointer;
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 0.75rem;
+            margin-bottom: 4px;
+        }
+        .empty-state {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.5);
+            padding: 60px 20px;
+        }
+        .empty-state i {
+            font-size: 3rem;
+            margin-bottom: 16px;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1><i class="fa-solid fa-cloud-arrow-up" style="margin-right: 10px;"></i>Backup History</h1>
+        </div>
+        <div id="backup-list">
+            <div class="empty-state">
+                <i class="fa-solid fa-spinner fa-spin"></i>
+                Loading...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function loadHistory() {
+            try {
+                const res = await fetch('/api/auto-backup/history');
+                const history = await res.json();
+                const container = document.getElementById('backup-list');
+
+                if (!history || history.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <i class="fa-solid fa-box-open"></i>
+                            <p>No backup history yet</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                container.innerHTML = history.map(entry => {
+                    const date = new Date(entry.timestamp);
+                    const timeStr = date.toLocaleString('en-US', {
+                        timeZone: 'America/Los_Angeles',
+                        year: 'numeric', month: 'short', day: 'numeric',
+                        hour: 'numeric', minute: '2-digit', second: '2-digit',
+                        hour12: true, timeZoneName: 'short'
+                    });
+                    const errorHtml = entry.error
+                        ? `<div class="backup-error">${escapeHtml(entry.error)}</div>`
+                        : '';
+                    const outputHtml = entry.stdout
+                        ? `<details class="backup-output"><summary>Show output</summary>${escapeHtml(entry.stdout)}</details>`
+                        : '';
+
+                    return `
+                        <div class="backup-entry ${entry.status}">
+                            <div class="backup-header">
+                                <span class="backup-time">${timeStr}</span>
+                                <span class="backup-status-badge ${entry.status}">${entry.status === 'completed' ? 'Success' : 'Failed'}</span>
+                            </div>
+                            ${errorHtml}
+                            ${outputHtml}
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                document.getElementById('backup-list').innerHTML = `
+                    <div class="empty-state">
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+                        <p>Failed to load backup history</p>
+                    </div>
+                `;
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        loadHistory();
     </script>
 </body>
 </html>

@@ -76,6 +76,16 @@ class ChatApp {
     // Store element references (will be populated in initComponents)
     this.elements = {};
 
+    // Agent running state (for stop button)
+    this.isAgentRunning = false;
+    this.cancelPressCount = 0;
+
+    // Resume-on-reconnect: if the WS drops while the agent is running, we
+    // stash the last payload and re-send it once the socket reconnects so
+    // the user gets a response without having to retype.
+    this.lastSentMessageData = null;
+    this.pendingResendData = null;
+
     // Activity tracking for lease management
     this.lastActivitySync = 0;
     this.ACTIVITY_SYNC_INTERVAL = 60000; // Sync to backend every 60 seconds max
@@ -197,9 +207,82 @@ class ChatApp {
     const socket = this.webSocketManager.connect();
     this.appState.setSocket(socket);
 
-    // Listen for websocket disconnection to hide thinking indicator
-    window.addEventListener('websocketDisconnected', () => {
+    // On transient disconnects, leave the thinking indicator running — the
+    // backend agent task is cancelled but we'll re-send the last message on
+    // reconnect (see resume-on-reconnect below). Only show the lost-connection
+    // error when retries are exhausted.
+    window.addEventListener('websocketReconnectFailed', () => {
+      this.pendingResendData = null;
       this.hideThinkingIndicator();
+      this.setAgentRunning(false);
+    });
+
+    // If the WS drops while the agent is running, queue the last payload for
+    // resend on the next successful (re)connect.
+    window.addEventListener('websocketDisconnected', () => {
+      if (this.isAgentRunning && this.lastSentMessageData) {
+        this.pendingResendData = this.lastSentMessageData;
+      }
+    });
+
+    // On (re)connect, flush any queued resend. The small delay lets the auth
+    // message go first (sendAuthMessage is async; see checkAutoPrompt for the
+    // same pattern).
+    window.addEventListener('websocketConnected', () => {
+      if (!this.pendingResendData) return;
+      const payload = this.pendingResendData;
+      this.pendingResendData = null;
+      setTimeout(() => {
+        if (this.webSocketManager?.send(payload)) {
+          console.log('Resumed: re-sent last message after reconnect');
+        }
+      }, 300);
+    });
+
+    // Listen for agent task completion to stop duration timer and show elapsed time
+    window.addEventListener('agentTaskCompleted', (event) => {
+      const elapsedTime = event.detail?.elapsedTime;
+      this.stopDurationTimerDisplay();
+      this.setAgentRunning(false);
+      this.lastSentMessageData = null;
+      this.pendingResendData = null;
+
+      // Update any completed plan badges with the elapsed time
+      if (elapsedTime) {
+        this.updateCompletedPlanBadges(elapsedTime);
+      }
+    });
+
+    // Listen for HITL approval decisions and send via WebSocket
+    window.addEventListener('approvalDecision', (event) => {
+      if (!this.webSocketManager) return;
+      const { decisions, thread_id, agent_name } = event.detail;
+      this.webSocketManager.send({
+        type: 'approval_response',
+        decisions,
+        thread_id,
+        agent_name,
+      });
+    });
+
+    // Listen for HITL rejection — cancel the run and tell Leonardo
+    window.addEventListener('approvalRejected', (event) => {
+      if (!this.webSocketManager) return;
+      const { thread_id, agent_name, toolName } = event.detail;
+      // Cancel the paused graph
+      this.webSocketManager.send({ type: 'cancel' });
+      // Send a follow-up message so Leonardo knows why
+      setTimeout(() => {
+        this.webSocketManager.send({
+          message: `I rejected your proposed ${toolName} edit. Please don't make that change.`,
+          thread_id,
+          agent_name,
+          agent_mode: this.elements.agentModeSelect?.value,
+          llm_model: this.elements.modelSelect?.value || 'deepseek-v4-flash',
+          origin: window.location.host,
+          ask_before_edits: true,
+        });
+      }, 500);
     });
 
     // Initialize event listeners
@@ -234,18 +317,24 @@ class ChatApp {
       this.elements.fileInput,
       this.elements.attachmentsPreview
     );
+    this.fileAttachmentManager.initUploadMenu(
+      this.container.querySelector('[data-llamabot="file-attach-menu"]'),
+      this.container.querySelector('[data-llamabot="attach-for-ai-btn"]'),
+      this.container.querySelector('[data-llamabot="upload-to-assets-btn"]'),
+      this.container.querySelector('[data-llamabot="upload-file-input"]')
+    );
+    this.fileAttachmentManager.initFileBrowser(
+      this.container.querySelector('[data-llamabot="browse-files-btn"]'),
+      this.container.querySelector('[data-llamabot="file-browser-panel"]'),
+      this.container.querySelector('[data-llamabot="file-browser-list"]'),
+      this.container.querySelector('[data-llamabot="file-browser-close"]')
+    );
     this.fileAttachmentManager.setupDragAndDrop(
       this.elements.inputArea,
       this.elements.dropZoneOverlay
     );
     this.fileAttachmentManager.setupPaste(this.elements.messageInput);
 
-    // Close toolbar when file attach is clicked
-    if (this.elements.fileAttachBtn) {
-      this.elements.fileAttachBtn.addEventListener('click', () => {
-        this.closeToolsToolbar();
-      });
-    }
 
     // Initialize screen recorder
     this.screenRecorder = new ScreenRecorder();
@@ -268,8 +357,21 @@ class ChatApp {
     // Load settings from cookies
     this.loadSettingsFromCookies();
 
+    // Check for ?llm_model= URL param (e.g. funnels that need an image-capable
+    // model); overrides the cookie and must run before any auto-send below.
+    this.checkModelParam();
+
     // Fetch available models and disable unavailable ones
     this.fetchAvailableModels();
+
+    // Check for ?conversation= URL parameter and render pre-loaded messages
+    this.checkConversationParam();
+
+    // Check for ?prompt= URL parameter and auto-send after WebSocket connects
+    this.checkAutoPrompt();
+
+    // Check for ?welcome_prompt= URL parameter (fade-in + confetti on completion)
+    this.checkWelcomePrompt();
 
     // Dispatch ready event for external scripts to hook into
     window.dispatchEvent(new CustomEvent('llamabot:ready', { detail: { instance: this } }));
@@ -311,6 +413,10 @@ class ChatApp {
       collapsedRecordingTimer: this.container.querySelector('[data-llamabot="collapsed-recording-timer"]'),
       floatingRecordIndicator: this.container.querySelector('[data-llamabot="floating-record-indicator"]'),
       floatingRecordTimer: this.container.querySelector('[data-llamabot="floating-record-timer"]'),
+      executionModeSelector: this.container.querySelector('[data-llamabot="execution-mode-selector"]'),
+      executionModeTrigger: this.container.querySelector('[data-llamabot="execution-mode-trigger"]'),
+      executionModeLabel: this.container.querySelector('[data-llamabot="execution-mode-label"]'),
+      executionModeMenu: this.container.querySelector('[data-llamabot="execution-mode-menu"]'),
       stopRecordingBtn: this.container.querySelector('[data-llamabot="stop-recording-btn"]')
     };
   }
@@ -319,9 +425,15 @@ class ChatApp {
    * Initialize event listeners
    */
   initEventListeners() {
-    // Send button
+    // Send button (doubles as stop button when agent is running)
     if (this.elements.sendButton) {
-      this.elements.sendButton.addEventListener('click', () => this.sendMessageWithDebugInfo());
+      this.elements.sendButton.addEventListener('click', () => {
+        if (this.isAgentRunning) {
+          this.handleStopClick();
+        } else {
+          this.sendMessageWithDebugInfo();
+        }
+      });
     }
 
     // Message input
@@ -329,7 +441,12 @@ class ChatApp {
       this.elements.messageInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
-          this.sendMessageWithDebugInfo();
+          const hasText = this.elements.messageInput.value.trim().length > 0;
+          if (hasText) {
+            this.sendMessageWithDebugInfo();
+          } else if (this.isAgentRunning) {
+            this.handleStopClick();
+          }
         }
       });
     }
@@ -353,6 +470,31 @@ class ChatApp {
       });
       // Initialize with short label
       this.updateDropdownLabel(this.elements.modelSelect);
+    }
+
+    // Execution mode dropdown (Plan/Ask/Auto)
+    if (this.elements.executionModeTrigger && this.elements.executionModeMenu) {
+      // Toggle menu on trigger click
+      this.elements.executionModeTrigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.elements.executionModeMenu.classList.toggle('hidden');
+      });
+
+      // Handle option selection
+      this.elements.executionModeMenu.querySelectorAll('.execution-mode-option').forEach(option => {
+        option.addEventListener('click', () => {
+          const mode = option.dataset.mode;
+          this.setExecutionMode(mode);
+          this.elements.executionModeMenu.classList.add('hidden');
+        });
+      });
+
+      // Close menu when clicking outside
+      document.addEventListener('click', (e) => {
+        if (this.elements.executionModeSelector && !this.elements.executionModeSelector.contains(e.target)) {
+          this.elements.executionModeMenu.classList.add('hidden');
+        }
+      });
     }
 
     // Tools toolbar toggle
@@ -469,6 +611,11 @@ class ChatApp {
           // Trigger input event to update send button state
           this.elements.messageInput.dispatchEvent(new Event('input', { bubbles: true }));
           console.log('Launchpad: Prefilled chat with command:', command);
+
+          if (event.data.auto_send) {
+            this.sendMessageWithDebugInfo();
+            console.log('Launchpad: Auto-sent prefilled command');
+          }
         }
       }
     });
@@ -558,6 +705,220 @@ class ChatApp {
   }
 
   /**
+   * Handle stop button click (two-stage cancel)
+   */
+  handleStopClick() {
+    if (!this.webSocketManager) return;
+    this.webSocketManager.send({ type: 'cancel' });
+    this.cancelPressCount++;
+    this.lastSentMessageData = null;
+    this.pendingResendData = null;
+  }
+
+  /**
+   * Update agent running state and toggle send/stop button appearance
+   */
+  setAgentRunning(running) {
+    this.isAgentRunning = running;
+    if (!running) {
+      this.cancelPressCount = 0;
+    }
+    const btn = this.elements.sendButton;
+    if (!btn) return;
+    const icon = btn.querySelector('i');
+    if (running) {
+      btn.classList.add('stop-mode');
+      btn.disabled = false;
+      if (icon) {
+        icon.className = 'fa-solid fa-stop';
+      }
+    } else {
+      btn.classList.remove('stop-mode');
+      if (icon) {
+        icon.className = 'fa-solid fa-arrow-up';
+      }
+    }
+  }
+
+  /**
+   * Update execution mode UI and state
+   */
+  setExecutionMode(mode) {
+    const labels = { auto: 'Auto', ask: 'Ask', plan: 'Plan' };
+    const iconClasses = {
+      auto: 'fa-solid fa-forward',
+      ask: 'fa-solid fa-shield-halved',
+      plan: 'fa-solid fa-pause',
+    };
+    this.appState.setExecutionMode(mode);
+    setCookie('executionMode', mode, this.config.cookieExpiryDays);
+
+    // Update trigger label
+    if (this.elements.executionModeLabel) {
+      this.elements.executionModeLabel.textContent = labels[mode] || mode;
+    }
+    // Update trigger icon
+    const iconEl = this.elements.executionModeTrigger?.querySelector('.execution-mode-icon');
+    if (iconEl) {
+      iconEl.innerHTML = `<i class="${iconClasses[mode] || 'fa-solid fa-forward'}"></i>`;
+    }
+
+    // Update checkmark in menu
+    if (this.elements.executionModeMenu) {
+      this.elements.executionModeMenu.querySelectorAll('.execution-mode-option').forEach(opt => {
+        const check = opt.querySelector('.execution-mode-check');
+        if (opt.dataset.mode === mode) {
+          opt.classList.add('selected');
+          if (!check) {
+            const title = opt.querySelector('.execution-mode-option-title');
+            const checkSpan = document.createElement('span');
+            checkSpan.className = 'execution-mode-check';
+            checkSpan.textContent = '✓';
+            title.prepend(checkSpan);
+          }
+        } else {
+          opt.classList.remove('selected');
+          if (check) check.remove();
+        }
+      });
+    }
+  }
+
+  /**
+   * Check for ?conversation= URL parameter and render pre-loaded chat bubbles.
+   * Expects a base64-encoded JSON array: [{"role":"human"|"ai","content":"..."},...]
+   */
+  checkConversationParam() {
+    const params = new URLSearchParams(window.location.search);
+    const conversationB64 = params.get('conversation');
+    if (!conversationB64) return;
+
+    // Remove the param from URL so refresh doesn't duplicate
+    const url = new URL(window.location);
+    url.searchParams.delete('conversation');
+    window.history.replaceState({}, '', url);
+
+    try {
+      const json = atob(conversationB64);
+      const messages = JSON.parse(json);
+
+      if (!Array.isArray(messages)) return;
+
+      for (const msg of messages) {
+        if (!msg.content || !msg.role) continue;
+        const type = msg.role === 'human' ? 'human' : 'ai';
+        this.messageRenderer.addMessage(msg.content, type);
+      }
+    } catch (e) {
+      console.error('Failed to parse ?conversation= parameter:', e);
+    }
+  }
+
+  /**
+   * Check for ?prompt= URL parameter and auto-send once WebSocket is connected
+   */
+  checkAutoPrompt() {
+    const params = new URLSearchParams(window.location.search);
+    const autoPrompt = params.get('prompt');
+    if (!autoPrompt) return;
+
+    // Remove the prompt param from URL so it doesn't re-send on refresh
+    const url = new URL(window.location);
+    url.searchParams.delete('prompt');
+    window.history.replaceState({}, '', url);
+
+    // Wait for WebSocket connection + auth to complete, then send
+    const sendOnConnect = () => {
+      // Small delay to ensure auth message is sent first (sendAuthMessage is async)
+      setTimeout(() => {
+        const input = this.elements.messageInput;
+        if (input) {
+          input.value = autoPrompt;
+        }
+        this.sendMessageWithDebugInfo();
+      }, 300);
+    };
+
+    if (this.webSocketManager?.socket?.readyState === 1) {
+      sendOnConnect();
+    } else {
+      window.addEventListener('websocketConnected', sendOnConnect, { once: true });
+    }
+  }
+
+  /**
+   * Check for ?llm_model= URL parameter and pin the model for this session.
+   * Used by funnels (e.g. mothership picture-to-html) that need an image-capable
+   * model since the default DeepSeek cannot view images. Persists to the llmModel
+   * cookie so the whole session stays on the chosen model, not just the first turn.
+   * Ignores unknown keys, matching the cookie-restore guard in loadSettingsFromCookies().
+   */
+  checkModelParam() {
+    const params = new URLSearchParams(window.location.search);
+    const model = params.get('llm_model');
+    if (!model) return;
+
+    // Remove the param so a refresh doesn't re-apply it after a manual switch
+    const url = new URL(window.location);
+    url.searchParams.delete('llm_model');
+    window.history.replaceState({}, '', url);
+
+    if (!this.elements.modelSelect) return;
+    const isValid = Array.from(this.elements.modelSelect.options).some(option => option.value === model);
+    if (!isValid) return;
+
+    this.elements.modelSelect.value = model;
+    setCookie('llmModel', model, this.config.cookieExpiryDays);
+    this.updateDropdownLabel(this.elements.modelSelect);
+  }
+
+  /**
+   * Check for ?welcome_prompt= URL parameter.
+   * Same as ?prompt= but also triggers a fade-in on the UI and confetti on completion.
+   */
+  checkWelcomePrompt() {
+    const params = new URLSearchParams(window.location.search);
+    const welcomePrompt = params.get('welcome_prompt');
+    if (!welcomePrompt) return;
+
+    // Remove the param from URL so it doesn't re-send on refresh
+    const url = new URL(window.location);
+    url.searchParams.delete('welcome_prompt');
+    window.history.replaceState({}, '', url);
+
+    // Fade-in effect on the chat UI
+    document.body.classList.add('welcome-fade-in');
+
+    // Set flag so MessageRenderer fires confetti on stream end
+    window._welcomePromptActive = true;
+    window.addEventListener('streamEnded', () => {
+      if (!window._welcomePromptActive) return;
+      window._welcomePromptActive = false;
+      if (typeof confetti === 'function') {
+        confetti({ particleCount: 150, spread: 80, origin: { y: 0.6 } });
+        setTimeout(() => confetti({ particleCount: 80, spread: 100, origin: { y: 0.5 } }), 300);
+      }
+    }, { once: true });
+
+    // Auto-send the prompt (same logic as checkAutoPrompt)
+    const sendOnConnect = () => {
+      setTimeout(() => {
+        const input = this.elements.messageInput;
+        if (input) {
+          input.value = welcomePrompt;
+        }
+        this.sendMessageWithDebugInfo();
+      }, 300);
+    };
+
+    if (this.webSocketManager?.socket?.readyState === 1) {
+      sendOnConnect();
+    } else {
+      window.addEventListener('websocketConnected', sendOnConnect, { once: true });
+    }
+  }
+
+  /**
    * Send message via WebSocket
    */
   sendMessage(debugInfo = null) {
@@ -566,7 +927,13 @@ class ChatApp {
 
     let message = input.value.trim();
     const agentMode = this.elements.agentModeSelect?.value;
-    const llmModel = this.elements.modelSelect?.value || 'gemini-3-flash';
+    const llmModel = this.elements.modelSelect?.value || 'deepseek-v4-flash';
+
+    // Ensure AppState is synchronized with current dropdown value before sending
+    // This fixes a race condition where AppState could be stale after page initialization
+    if (agentMode) {
+      this.appState.setAgentMode(agentMode);
+    }
 
     if (!message || !this.webSocketManager) return;
 
@@ -576,10 +943,37 @@ class ChatApp {
       message = `${promptContent}\n\n${message}`;
     }
 
+    // Append skill contents after prompt, before user message
+    const skillsContent = this.promptManager?.getSelectedSkillsContent();
+    if (skillsContent && skillsContent.length > 0) {
+      const skillsText = skillsContent.join('\n\n---\n\n');
+      // Insert skills between prompt and user's typed message
+      // If prompt was prepended, skills go after it but before the original message
+      if (promptContent) {
+        // message is currently: promptContent + "\n\n" + originalMessage
+        // We want: promptContent + "\n\n" + skillsText + "\n\n" + originalMessage
+        const originalMessage = message.substring(promptContent.length + 2);
+        message = `${promptContent}\n\n${skillsText}\n\n${originalMessage}`;
+      } else {
+        // No prompt, just prepend skills before the user message
+        message = `${skillsText}\n\n${message}`;
+      }
+    }
+
     // Check if there's a selected element and append it to the message
     const selectedHTML = this.elementSelector?.getSelectedElementHTML();
     if (selectedHTML) {
       message = `${message}\n\n<SELECTED_ELEMENT>\n${selectedHTML}\n</SELECTED_ELEMENT>`;
+    }
+
+    // Get file attachments before clearing (needed for display)
+    const attachments = this.fileAttachmentManager?.getAttachments() || [];
+
+    // Append uploaded file references to the message so the AI knows about them
+    const uploadedFiles = attachments.filter(a => a.type === 'uploaded_file');
+    if (uploadedFiles.length > 0) {
+      const fileList = uploadedFiles.map(f => `- ${f.filename} (saved to ${f.path})`).join('\n');
+      message = `${message}\n\n<UPLOADED_FILES>\nThe user uploaded the following files to the Rails app:\n${fileList}\n</UPLOADED_FILES>`;
     }
 
     // Reset state
@@ -587,13 +981,17 @@ class ChatApp {
     this.streamingState.reset();
     this.iframeManager.removeStreamingOverlay();
 
-    // Get file attachments before clearing (needed for display)
-    const attachments = this.fileAttachmentManager?.getAttachments() || [];
+    // Show building overlay for beginner and plan modes
+    const executionModeForOverlay = this.appState.getExecutionMode();
+    if (agentMode === 'beginner' || executionModeForOverlay === 'plan') {
+      this.iframeManager.createStreamingOverlay({ showCloseButton: true, text: 'Your App is Building!' });
+    }
 
     // Extract attachment metadata for display (without large base64 data)
     const attachmentMeta = attachments.map(a => ({
       filename: a.filename,
-      mime_type: a.mime_type
+      mime_type: a.mime_type,
+      ...(a.path ? { path: a.path } : {})
     }));
 
     // Add user message with attachment badges
@@ -629,6 +1027,9 @@ class ChatApp {
       this.faviconBadgeManager.startThinking();
     }
 
+    // Start the duration timer
+    this.startDurationTimerDisplay();
+
     // Change placeholder text while thinking
     input.placeholder = 'Queue another message...';
 
@@ -661,19 +1062,30 @@ class ChatApp {
     // Force scroll to bottom for user messages
     this.scrollManager.scrollToBottom(true);
 
+    // Determine agent name based on execution mode
+    const executionMode = this.appState.getExecutionMode();
+    let agentName = this.appState.getAgentConfig().name;
+    if (executionMode === 'plan') {
+      agentName = 'rails_plan_mode_agent'; // Plan mode uses plan agent
+    }
+
     // Send message
     const messageData = {
       message: message,
       thread_id: threadId,
       origin: window.location.host,
       debug_info: debugInfo,
-      agent_name: this.appState.getAgentConfig().name,
+      agent_name: agentName,
       agent_mode: agentMode,
       llm_model: llmModel,
-      attachments: attachments
+      attachments: attachments.filter(a => a.type !== 'uploaded_file'),
+      ask_before_edits: executionMode === 'ask'
     };
 
     this.webSocketManager.send(messageData);
+    this.lastSentMessageData = messageData;
+    this.pendingResendData = null;
+    this.setAgentRunning(true);
 
     // Call custom callback if provided
     if (this.config.onMessageReceived) {
@@ -772,6 +1184,12 @@ class ChatApp {
         this.appState.setAgentMode(this.elements.agentModeSelect.value);
         this.updateDropdownLabel(this.elements.agentModeSelect);
       }
+    }
+
+    // Restore execution mode from cookie
+    const savedExecMode = getCookie('executionMode');
+    if (savedExecMode && ['auto', 'ask', 'plan'].includes(savedExecMode)) {
+      this.setExecutionMode(savedExecMode);
     }
 
     const savedModel = getCookie('llmModel');
@@ -1047,6 +1465,94 @@ class ChatApp {
         this.messageRenderer.renderErrorMessage('Lost connection');
       }
     }
+
+    // Also stop the duration timer on disconnect
+    this.stopDurationTimerDisplay();
+  }
+
+  // ==========================================
+  // Duration Timer Display Methods
+  // ==========================================
+
+  /**
+   * Start the duration timer display
+   * Timer is shown inline with the thinking indicator text
+   */
+  startDurationTimerDisplay() {
+    // Start the timer in app state
+    this.appState.startTaskTimer();
+
+    // Update every second - the timer text is injected into the thinking area
+    this.appState.taskTimerInterval = setInterval(() => {
+      this.updateTimerInThinkingArea();
+    }, 1000);
+  }
+
+  /**
+   * Update the timer display in the thinking area
+   * Appends/updates the timer text next to the thinking indicator
+   */
+  updateTimerInThinkingArea() {
+    if (!this.elements.thinkingArea) return;
+
+    const elapsedTime = this.appState.getFormattedElapsedTime();
+    let timerSpan = this.elements.thinkingArea.querySelector('.duration-timer-inline');
+
+    if (!timerSpan) {
+      // Create the timer span if it doesn't exist
+      timerSpan = document.createElement('span');
+      timerSpan.className = 'duration-timer-inline';
+      timerSpan.innerHTML = `
+        <svg class="timer-icon" viewBox="0 0 24 24" width="12" height="12">
+          <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/>
+          <path d="M12 6v6l4 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <span class="timer-text">${elapsedTime}</span>
+      `;
+      this.elements.thinkingArea.appendChild(timerSpan);
+    } else {
+      // Update existing timer
+      const timerText = timerSpan.querySelector('.timer-text');
+      if (timerText) {
+        timerText.textContent = elapsedTime;
+      }
+    }
+  }
+
+  /**
+   * Stop the duration timer display
+   * Called when task completes or on disconnect
+   */
+  stopDurationTimerDisplay() {
+    // Stop the timer in app state
+    this.appState.stopTaskTimer();
+
+    // Remove timer from thinking area if it exists
+    if (this.elements.thinkingArea) {
+      const timerSpan = this.elements.thinkingArea.querySelector('.duration-timer-inline');
+      if (timerSpan) {
+        timerSpan.remove();
+      }
+    }
+
+    // Reset depth tracking
+    this.appState.resetDepthTracking();
+  }
+
+  /**
+   * Update completed plan badges with the elapsed time
+   * Finds plan badges that show "✓ Complete" and appends the elapsed time
+   */
+  updateCompletedPlanBadges(elapsedTime) {
+    // Find all plan done badges that don't already have a time
+    const doneBadges = this.container.querySelectorAll('.plan-done-badge:not([data-has-time])');
+
+    doneBadges.forEach(badge => {
+      // Mark as having time so we don't add it twice
+      badge.setAttribute('data-has-time', 'true');
+      // Append the elapsed time
+      badge.innerHTML = `✓ Complete <span class="plan-elapsed-time">${elapsedTime}</span>`;
+    });
   }
 
   /**
